@@ -21,25 +21,33 @@ export default async function handler(req, res) {
     }
 
     // ================= PUSH =================
-    if (event === "push") {
-      const branch = req.body.ref.replace("refs/heads/", "");
-      if (branch !== ALLOWED_BRANCH) return res.status(200).end();
+if (event === "push") {
+  const branch = req.body.ref.replace("refs/heads/", "");
+  if (branch !== ALLOWED_BRANCH) return res.status(200).end();
 
-      const repo = req.body.repository.full_name;
-      const commits = req.body.commits.slice(-3);
+  const repo = req.body.repository.full_name;
+  const commits = req.body.commits.slice(-3);
+  const pushUrl = req.body.compare;
 
-      let text = `🚀 Git Push\nRepo: ${repo}\nBranch: ${branch}\n\n`;
+  let text = `🚀 Git Push\nRepo: ${repo}\nBranch: ${branch}\n\n`;
 
-      commits.forEach(c => {
-        text += `• ${c.author.name}: ${c.message}\n`;
-      });
+  commits.forEach(c => {
+    text += `• ${c.author.name}: ${c.message}\n${c.url}\n\n`;
+  });
 
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ chat_id: CHAT_ID, text })
-      });
-    }
+  text += `View push:\n${pushUrl}`;
+
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      chat_id: CHAT_ID,
+      text,
+      disable_web_page_preview: false
+    })
+  });
+}
+
 
     // ================= CLOUDLFARE DEPLOY STATUS =================
     if (event === "workflow_run") {
