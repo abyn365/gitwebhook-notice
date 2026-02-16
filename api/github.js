@@ -43,32 +43,34 @@ export default async function handler(req, res) {
 
     // ================= CLOUDLFARE DEPLOY STATUS =================
     if (event === "workflow_run") {
-      const wf = req.body.workflow_run;
+  const wf = req.body.workflow_run;
 
-      // filter hanya workflow deploy cloudflare
-      if (!wf.name.toLowerCase().includes("cloudflare")) {
-        return res.status(200).end();
-      }
+  if (!wf.name.toLowerCase().includes("cloudflare")) {
+    return res.status(200).end();
+  }
 
-      const status = wf.conclusion;
-      const branch = wf.head_branch;
+  let statusText;
 
-      const message =
+  if (wf.status === "queued") statusText = "queued";
+  else if (wf.status === "in_progress") statusText = "building";
+  else if (wf.status === "completed") statusText = wf.conclusion;
+
+  const message =
 `☁️ Cloudflare Deploy
 
 Repo: ${req.body.repository.full_name}
-Branch: ${branch}
+Branch: ${wf.head_branch}
 Workflow: ${wf.name}
-Status: ${status}
+Status: ${statusText}
 
 ${wf.html_url}`;
 
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ chat_id: CHAT_ID, text: message })
-      });
-    }
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ chat_id: CHAT_ID, text: message })
+  });
+}
 
     res.status(200).end();
 
