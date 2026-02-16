@@ -1,0 +1,7 @@
+{
+  "name": "github-telegram-webhook",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
