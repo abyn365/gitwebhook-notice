@@ -1,81 +1,92 @@
-import crypto from "crypto";
+// simpan message id sementara di memory
+const deployMessages = {};
 
-export const config = { runtime: "nodejs" };
-
-export default async function handler(req, res) {
-  try {
-    const BOT_TOKEN = process.env.BOT_TOKEN;
-    const CHAT_ID = process.env.CHAT_ID;
-    const SECRET = process.env.WEBHOOK_SECRET;
-    const ALLOWED_BRANCH = process.env.ALLOWED_BRANCH || "main";
-
-    const signature = req.headers["x-hub-signature-256"];
-    const event = req.headers["x-github-event"];
-
-    const raw = JSON.stringify(req.body);
-    const hmac = crypto.createHmac("sha256", SECRET);
-    const digest = "sha256=" + hmac.update(raw).digest("hex");
-
-    if (!signature || signature !== digest) {
-      return res.status(401).send("Invalid signature");
-    }
-
-    // ================= PUSH =================
-    if (event === "push") {
-      const branch = req.body.ref.replace("refs/heads/", "");
-      if (branch !== ALLOWED_BRANCH) return res.status(200).end();
-
-      const repo = req.body.repository.full_name;
-      const commits = req.body.commits.slice(-3);
-
-      let text = `🚀 Git Push\nRepo: ${repo}\nBranch: ${branch}\n\n`;
-
-      commits.forEach(c => {
-        text += `• ${c.author.name}: ${c.message}\n`;
-      });
-
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ chat_id: CHAT_ID, text })
-      });
-    }
-
-    // ================= CLOUDLFARE DEPLOY STATUS =================
-    if (event === "workflow_run") {
+if (event === "workflow_run") {
   const wf = req.body.workflow_run;
 
+  // hanya workflow cloudflare
   if (!wf.name.toLowerCase().includes("cloudflare")) {
     return res.status(200).end();
   }
 
-  let statusText;
+  const key = wf.id; // unique tiap run
+  const repo = req.body.repository.full_name;
+  const branch = wf.head_branch;
+  const url = wf.html_url;
 
-  if (wf.status === "queued") statusText = "queued";
-  else if (wf.status === "in_progress") statusText = "building";
-  else if (wf.status === "completed") statusText = wf.conclusion;
+  // ================= START BUILD =================
+  if (wf.status === "in_progress") {
 
-  const message =
+    const message =
 `☁️ Cloudflare Deploy
 
-Repo: ${req.body.repository.full_name}
-Branch: ${wf.head_branch}
-Workflow: ${wf.name}
-Status: ${statusText}
+Repo: ${repo}
+Branch: ${branch}
+Status: building...
 
-${wf.html_url}`;
+${url}`;
 
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({ chat_id: CHAT_ID, text: message })
-  });
-}
+    const resTelegram = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text: message
+      })
+    });
 
-    res.status(200).end();
+    const data = await resTelegram.json();
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).end();
+    // simpan message id
+    deployMessages[key] = {
+      message_id: data.result.message_id,
+      start: Date.now()
+    };
+  }
+
+  // ================= FINISHED =================
+  if (wf.status === "completed") {
+
+    const msg = deployMessages[key];
+
+    let duration = "";
+    if (msg?.start) {
+      duration = Math.round((Date.now() - msg.start) / 1000);
+    }
+
+    const finalMessage =
+`☁️ Cloudflare Deploy
+
+Repo: ${repo}
+Branch: ${branch}
+Status: ${wf.conclusion}
+Duration: ${duration}s
+
+${url}`;
+
+    if (msg?.message_id) {
+      // edit pesan lama
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          message_id: msg.message_id,
+          text: finalMessage
+        })
+      });
+
+      delete deployMessages[key];
+    } else {
+      // fallback kalau message id tidak ada
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          text: finalMessage
+        })
+      });
+    }
   }
 }
