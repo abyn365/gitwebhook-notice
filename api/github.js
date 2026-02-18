@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { kv } from "@vercel/kv";
+import { createClient } from "redis";
 
 export const config = { runtime: "nodejs" };
 
@@ -10,8 +10,46 @@ const WORKFLOW_MESSAGE_TTL_MS = 24 * 60 * 60 * 1000;
 const EVENT_DEDUP_TTL_SECONDS = EVENT_DEDUP_TTL_MS / 1000;
 const WORKFLOW_MESSAGE_TTL_SECONDS = WORKFLOW_MESSAGE_TTL_MS / 1000;
 
-function canUseKv() {
-  return Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+let redisClient;
+let redisConnectPromise;
+
+function getRedisUrl() {
+  return process.env.webhook_REDIS_URL || process.env.REDIS_URL || null;
+}
+
+function canUseRedis() {
+  return Boolean(getRedisUrl());
+}
+
+async function getRedisClient() {
+  if (!canUseRedis()) {
+    return null;
+  }
+
+  if (!redisClient) {
+    redisClient = createClient({ url: getRedisUrl() });
+    redisClient.on("error", (error) => {
+      console.error("Redis error", error);
+    });
+  }
+
+  if (redisClient.isOpen) {
+    return redisClient;
+  }
+
+  if (!redisConnectPromise) {
+    redisConnectPromise = redisClient.connect()
+      .catch((error) => {
+        redisConnectPromise = null;
+        throw error;
+      })
+      .then(() => {
+        redisConnectPromise = null;
+      });
+  }
+
+  await redisConnectPromise;
+  return redisClient;
 }
 
 function cleanupMap(map, ttl) {
@@ -42,12 +80,16 @@ function isDuplicateEventInMemory(eventKey) {
 }
 
 async function isDuplicateEvent(eventKey) {
-  if (!canUseKv()) {
+  const redis = await getRedisClient();
+  if (!redis) {
     return isDuplicateEventInMemory(eventKey);
   }
 
   const key = `github:dedup:${eventKey}`;
-  const setResult = await kv.set(key, "1", { nx: true, ex: EVENT_DEDUP_TTL_SECONDS });
+  const setResult = await redis.set(key, "1", {
+    EX: EVENT_DEDUP_TTL_SECONDS,
+    NX: true
+  });
   return setResult !== "OK";
 }
 
@@ -113,19 +155,22 @@ function shouldTrackWorkflow(name) {
 
 async function getWorkflowTracking(workflowRunId) {
   const key = `github:workflow:${workflowRunId}`;
+  const redis = await getRedisClient();
 
-  if (!canUseKv()) {
+  if (!redis) {
     cleanupMap(workflowMessageMap, WORKFLOW_MESSAGE_TTL_MS);
     return workflowMessageMap.get(`${workflowRunId}`) || null;
   }
 
-  return kv.get(key);
+  const raw = await redis.get(key);
+  return raw ? JSON.parse(raw) : null;
 }
 
 async function saveWorkflowTracking(workflowRunId, trackingData) {
   const key = `github:workflow:${workflowRunId}`;
+  const redis = await getRedisClient();
 
-  if (!canUseKv()) {
+  if (!redis) {
     workflowMessageMap.set(`${workflowRunId}`, {
       ...trackingData,
       updatedAt: Date.now()
@@ -133,7 +178,7 @@ async function saveWorkflowTracking(workflowRunId, trackingData) {
     return;
   }
 
-  await kv.set(key, trackingData, { ex: WORKFLOW_MESSAGE_TTL_SECONDS });
+  await redis.set(key, JSON.stringify(trackingData), { EX: WORKFLOW_MESSAGE_TTL_SECONDS });
 }
 
 async function upsertWorkflowNotification(botToken, chatId, workflowRun, message) {
