@@ -5,189 +5,139 @@ export const config = {
   runtime: "nodejs"
 };
 
-const processedEvents = new Map();
-const workflowMessageMap = new Map();
+// ================= REDIS =================
 
-const EVENT_DEDUP_TTL_MS =
-  6 * 60 * 60 * 1000;
+let redisClient = null;
+let redisPromise = null;
 
-const WORKFLOW_MESSAGE_TTL_MS =
-  24 * 60 * 60 * 1000;
-
-const EVENT_DEDUP_TTL_SECONDS =
-  EVENT_DEDUP_TTL_MS / 1000;
-
-const WORKFLOW_MESSAGE_TTL_SECONDS =
-  WORKFLOW_MESSAGE_TTL_MS / 1000;
-
-let redisClient;
-let redisConnectPromise;
-
-function getRedisUrl() {
-  return (
-    process.env.webhook_REDIS_URL ||
-    process.env.REDIS_URL ||
-    null
-  );
-}
-
-function canUseRedis() {
-  return Boolean(getRedisUrl());
-}
-
-async function getRedisClient() {
-  if (!canUseRedis()) {
-    return null;
+async function getRedis() {
+  if (redisClient?.isOpen) {
+    return redisClient;
   }
 
   if (!redisClient) {
     redisClient = createClient({
-      url: getRedisUrl()
+      url: process.env.REDIS_URL
     });
 
-    redisClient.on("error", (error) => {
-      console.error(
-        "Redis error:",
-        error
-      );
-    });
+    redisClient.on(
+      "error",
+      (err) => {
+        console.error(
+          "Redis Error:",
+          err
+        );
+      }
+    );
   }
 
-  if (redisClient.isOpen) {
-    return redisClient;
-  }
-
-  if (!redisConnectPromise) {
-    redisConnectPromise =
+  if (!redisPromise) {
+    redisPromise =
       redisClient
         .connect()
-        .catch((error) => {
-          redisConnectPromise =
-            null;
-
-          throw error;
-        })
         .then(() => {
-          redisConnectPromise =
-            null;
+          console.log(
+            "Redis connected"
+          );
+        })
+        .catch((err) => {
+          redisPromise = null;
+          throw err;
         });
   }
 
-  await redisConnectPromise;
+  await Promise.race([
+    redisPromise,
+    new Promise(
+      (_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                "Redis timeout"
+              )
+            ),
+          5000
+        )
+    )
+  ]);
 
   return redisClient;
 }
 
-function cleanupMap(map, ttl) {
-  const now = Date.now();
-
-  for (const [key, value] of map.entries()) {
-    if (
-      now - value.updatedAt >
-      ttl
-    ) {
-      map.delete(key);
-    }
-  }
-}
-
-function buildEventKey(req) {
-  const event =
-    req.headers["x-github-event"];
-
-  const delivery =
-    req.headers[
-      "x-github-delivery"
-    ] || "no-delivery";
-
-  const action =
-    req.body?.action ||
-    "no-action";
-
-  return `${event}:${delivery}:${action}`;
-}
-
-function isDuplicateEventInMemory(
-  eventKey
-) {
-  cleanupMap(
-    processedEvents,
-    EVENT_DEDUP_TTL_MS
-  );
-
-  if (
-    processedEvents.has(eventKey)
-  ) {
-    return true;
-  }
-
-  processedEvents.set(eventKey, {
-    updatedAt: Date.now()
-  });
-
-  return false;
-}
-
-async function isDuplicateEvent(
-  eventKey
-) {
-  const redis =
-    await getRedisClient();
-
-  if (!redis) {
-    return isDuplicateEventInMemory(
-      eventKey
-    );
-  }
-
-  const key = `github:dedup:${eventKey}`;
-
-  const result = await redis.set(
-    key,
-    "1",
-    {
-      EX: EVENT_DEDUP_TTL_SECONDS,
-      NX: true
-    }
-  );
-
-  return result !== "OK";
-}
+// ================= HELPERS =================
 
 async function telegramRequest(
   botToken,
   method,
   payload
 ) {
-  const response = await fetch(
-    `https://api.telegram.org/bot${botToken}/${method}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type":
-          "application/json"
-      },
-      body: JSON.stringify(payload)
-    }
+  const controller =
+    new AbortController();
+
+  const timeout = setTimeout(
+    () =>
+      controller.abort(),
+    10000
   );
 
-  if (!response.ok) {
-    const errorText =
-      await response.text();
+  try {
+    const response =
+      await fetch(
+        `https://api.telegram.org/bot${botToken}/${method}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+          body: JSON.stringify(
+            payload
+          ),
+          signal:
+            controller.signal
+        }
+      );
 
-    throw new Error(
-      `Telegram API ${method} failed: ${response.status} ${errorText}`
-    );
+    if (!response.ok) {
+      const text =
+        await response.text();
+
+      throw new Error(
+        `Telegram API error: ${text}`
+      );
+    }
+
+    return response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function shouldTrackWorkflow(
+  name
+) {
+  const filter =
+    process.env
+      .WORKFLOW_NAME_FILTER;
+
+  // Empty filter = all workflows
+  if (!filter) {
+    return true;
   }
 
-  return response.json();
+  return name
+    .toLowerCase()
+    .includes(
+      filter.toLowerCase()
+    );
 }
 
 function mapWorkflowStatus(wf) {
   if (wf.status === "queued") {
     return {
-      label: "queued",
-      emoji: "⏳"
+      emoji: "⏳",
+      label: "queued"
     };
   }
 
@@ -195,69 +145,27 @@ function mapWorkflowStatus(wf) {
     wf.status === "in_progress"
   ) {
     return {
-      label: "building",
-      emoji: "🛠️"
+      emoji: "🛠️",
+      label: "building"
     };
   }
 
   if (
     wf.status === "completed"
   ) {
-    if (
-      wf.conclusion ===
-      "success"
-    ) {
-      return {
-        label: "success",
-        emoji: "✅"
-      };
-    }
-
     return {
+      emoji:
+        wf.conclusion ===
+        "success"
+          ? "✅"
+          : "❌",
       label:
         wf.conclusion ||
-        "failure",
-      emoji: "❌"
+        "completed"
     };
   }
 
   return null;
-}
-
-function formatDuration(
-  startedAt,
-  endedAt
-) {
-  if (
-    !startedAt ||
-    !endedAt
-  ) {
-    return "-";
-  }
-
-  const ms =
-    new Date(endedAt).getTime() -
-    new Date(startedAt).getTime();
-
-  if (
-    Number.isNaN(ms) ||
-    ms < 0
-  ) {
-    return "-";
-  }
-
-  const totalSeconds =
-    Math.floor(ms / 1000);
-
-  const minutes =
-    Math.floor(
-      totalSeconds / 60
-    );
-
-  const seconds =
-    totalSeconds % 60;
-
-  return `${minutes}m ${seconds}s`;
 }
 
 function formatWorkflowMessage(
@@ -265,75 +173,45 @@ function formatWorkflowMessage(
   wf,
   status
 ) {
-  const duration =
-    wf.status === "completed"
-      ? formatDuration(
-          wf.run_started_at,
-          wf.updated_at
-        )
-      : "-";
-
   return `${status.emoji} GitHub Action
 
 Repo: ${repository.full_name}
-Branch: ${wf.head_branch}
 Workflow: ${wf.name}
+Branch: ${wf.head_branch}
 Status: ${status.label}
 Actor: ${
     wf.actor?.login ||
     "unknown"
   }
-Commit: ${
-    wf.head_commit?.id?.slice(
-      0,
-      7
-    ) || "-"
-  }
-Duration: ${duration}
 
 ${wf.html_url}`;
 }
 
-function shouldTrackWorkflow(
-  name
+async function isDuplicateEvent(
+  redis,
+  eventKey
 ) {
-  const workflowFilter =
-    process.env
-      .WORKFLOW_NAME_FILTER;
+  const key = `github:event:${eventKey}`;
 
-  // No filter = all workflows
-  if (!workflowFilter) {
-    return true;
-  }
-
-  return name
-    .toLowerCase()
-    .includes(
-      workflowFilter.toLowerCase()
+  const result =
+    await redis.set(
+      key,
+      "1",
+      {
+        EX: 21600,
+        NX: true
+      }
     );
+
+  return result !== "OK";
 }
 
 async function getWorkflowTracking(
-  workflowRunId,
+  redis,
+  workflowId,
   chatId
 ) {
-  const key = `github:workflow:${workflowRunId}:${chatId}`;
-
-  const redis =
-    await getRedisClient();
-
-  if (!redis) {
-    cleanupMap(
-      workflowMessageMap,
-      WORKFLOW_MESSAGE_TTL_MS
-    );
-
-    return (
-      workflowMessageMap.get(
-        `${workflowRunId}:${chatId}`
-      ) || null
-    );
-  }
+  const key = `github:workflow:${workflowId}:${chatId}`;
 
   const raw =
     await redis.get(key);
@@ -344,79 +222,61 @@ async function getWorkflowTracking(
 }
 
 async function saveWorkflowTracking(
-  workflowRunId,
+  redis,
+  workflowId,
   chatId,
-  trackingData
+  data
 ) {
-  const key = `github:workflow:${workflowRunId}:${chatId}`;
-
-  const redis =
-    await getRedisClient();
-
-  if (!redis) {
-    workflowMessageMap.set(
-      `${workflowRunId}:${chatId}`,
-      {
-        ...trackingData,
-        updatedAt: Date.now()
-      }
-    );
-
-    return;
-  }
+  const key = `github:workflow:${workflowId}:${chatId}`;
 
   await redis.set(
     key,
-    JSON.stringify(
-      trackingData
-    ),
+    JSON.stringify(data),
     {
-      EX: WORKFLOW_MESSAGE_TTL_SECONDS
+      EX: 86400
     }
   );
 }
 
-async function upsertWorkflowNotification(
+async function upsertWorkflowMessage(
+  redis,
   botToken,
   chatId,
-  workflowRun,
-  message
+  workflow,
+  text
 ) {
-  cleanupMap(
-    workflowMessageMap,
-    WORKFLOW_MESSAGE_TTL_MS
-  );
-
-  const tracked =
+  const existing =
     await getWorkflowTracking(
-      workflowRun.id,
+      redis,
+      workflow.id,
       chatId
     );
 
-  if (!tracked) {
-    const created =
+  if (!existing) {
+    const sent =
       await telegramRequest(
         botToken,
         "sendMessage",
         {
           chat_id: chatId,
-          text: message,
+          text,
           disable_web_page_preview:
             true
         }
       );
 
     await saveWorkflowTracking(
-      workflowRun.id,
+      redis,
+      workflow.id,
       chatId,
       {
         messageId:
-          created.result
+          sent.result
             ?.message_id,
-        lastStatus:
-          workflowRun.status,
-        lastConclusion:
-          workflowRun.conclusion ||
+        status:
+          workflow.status,
+        conclusion:
+          workflow.conclusion ||
           null
       }
     );
@@ -425,12 +285,12 @@ async function upsertWorkflowNotification(
   }
 
   const sameStatus =
-    tracked.lastStatus ===
-    workflowRun.status;
+    existing.status ===
+    workflow.status;
 
   const sameConclusion =
-    tracked.lastConclusion ===
-    (workflowRun.conclusion ||
+    existing.conclusion ===
+    (workflow.conclusion ||
       null);
 
   if (
@@ -440,73 +300,38 @@ async function upsertWorkflowNotification(
     return;
   }
 
-  if (tracked.messageId) {
+  if (existing.messageId) {
     await telegramRequest(
       botToken,
       "editMessageText",
       {
         chat_id: chatId,
         message_id:
-          tracked.messageId,
-        text: message,
+          existing.messageId,
+        text,
         disable_web_page_preview:
           true
       }
     );
-  } else {
-    const created =
-      await telegramRequest(
-        botToken,
-        "sendMessage",
-        {
-          chat_id: chatId,
-          text: message,
-          disable_web_page_preview:
-            true
-        }
-      );
-
-    tracked.messageId =
-      created.result
-        ?.message_id;
   }
 
   await saveWorkflowTracking(
-    workflowRun.id,
+    redis,
+    workflow.id,
     chatId,
     {
       messageId:
-        tracked.messageId,
-      lastStatus:
-        workflowRun.status,
-      lastConclusion:
-        workflowRun.conclusion ||
+        existing.messageId,
+      status:
+        workflow.status,
+      conclusion:
+        workflow.conclusion ||
         null
     }
   );
 }
 
-async function sendToAllChats(
-  botToken,
-  chatIds,
-  method,
-  payloadBuilder
-) {
-  for (const chatId of chatIds) {
-    try {
-      await telegramRequest(
-        botToken,
-        method,
-        payloadBuilder(chatId)
-      );
-    } catch (error) {
-      console.error(
-        `Failed sending to ${chatId}:`,
-        error
-      );
-    }
-  }
-}
+// ================= MAIN =================
 
 export default async function handler(
   req,
@@ -518,13 +343,13 @@ export default async function handler(
         "x-github-event"
       ];
 
-    // Handle GitHub webhook ping
+    // GitHub webhook test
     if (event === "ping") {
       return res
         .status(200)
         .json({
           ok: true,
-          message: "pong"
+          pong: true
         });
     }
 
@@ -536,8 +361,8 @@ export default async function handler(
       ""
     )
       .split(",")
-      .map((id) =>
-        id.trim()
+      .map((v) =>
+        v.trim()
       )
       .filter(Boolean);
 
@@ -553,15 +378,18 @@ export default async function handler(
     if (
       !BOT_TOKEN ||
       !CHAT_IDS.length ||
-      !SECRET
+      !SECRET ||
+      !process.env.REDIS_URL
     ) {
       return res
         .status(500)
-        .send(
-          "Missing environment variables"
-        );
+        .json({
+          error:
+            "Missing environment variables"
+        });
     }
 
+    // Signature validation
     const signature =
       req.headers[
         "x-hub-signature-256"
@@ -571,13 +399,11 @@ export default async function handler(
       req.body
     );
 
-    const hmac =
-      crypto.createHmac(
+    const digest = `sha256=${crypto
+      .createHmac(
         "sha256",
         SECRET
-      );
-
-    const digest = `sha256=${hmac
+      )
       .update(raw)
       .digest("hex")}`;
 
@@ -592,19 +418,34 @@ export default async function handler(
         );
     }
 
-    const eventKey =
-      buildEventKey(req);
+    // Redis
+    const redis =
+      await getRedis();
 
-    if (
+    // Dedup
+    const delivery =
+      req.headers[
+        "x-github-delivery"
+      ] || "unknown";
+
+    const action =
+      req.body?.action ||
+      "none";
+
+    const eventKey = `${event}:${delivery}:${action}`;
+
+    const duplicate =
       await isDuplicateEvent(
+        redis,
         eventKey
-      )
-    ) {
+      );
+
+    if (duplicate) {
       return res
         .status(200)
-        .send(
-          "Duplicate webhook ignored"
-        );
+        .json({
+          duplicate: true
+        });
     }
 
     // ================= PUSH =================
@@ -634,7 +475,7 @@ export default async function handler(
           -3
         );
 
-      const pushUrl =
+      const compare =
         req.body.compare;
 
       let text = `🚀 Git Push
@@ -644,30 +485,37 @@ Branch: ${branch}
 
 `;
 
-      commits.forEach((c) => {
+      for (const c of commits) {
         text += `• ${c.author.name}: ${c.message}
 ${c.url}
 
 `;
-      });
+      }
 
-      text += `View push:
-${pushUrl}`;
+      text += `View Push:
+${compare}`;
 
-      await sendToAllChats(
-        BOT_TOKEN,
-        CHAT_IDS,
-        "sendMessage",
-        (chatId) => ({
-          chat_id: chatId,
-          text,
-          disable_web_page_preview:
-            false
-        })
-      );
+      for (const chatId of CHAT_IDS) {
+        await telegramRequest(
+          BOT_TOKEN,
+          "sendMessage",
+          {
+            chat_id: chatId,
+            text,
+            disable_web_page_preview:
+              false
+          }
+        );
+      }
+
+      return res
+        .status(200)
+        .json({
+          ok: true
+        });
     }
 
-    // ================= WORKFLOW RUN =================
+    // ================= WORKFLOW =================
 
     if (
       event ===
@@ -714,26 +562,36 @@ ${pushUrl}`;
         );
 
       for (const chatId of CHAT_IDS) {
-        await upsertWorkflowNotification(
+        await upsertWorkflowMessage(
+          redis,
           BOT_TOKEN,
           chatId,
           wf,
           message
         );
       }
+
+      return res
+        .status(200)
+        .json({
+          ok: true
+        });
     }
 
     return res
       .status(200)
-      .end();
+      .json({
+        ignored: true
+      });
   } catch (error) {
     console.error(error);
 
     return res
       .status(500)
-      .send(
-        error?.message ||
+      .json({
+        error:
+          error.message ||
           "Internal Server Error"
-      );
+      });
   }
 }
