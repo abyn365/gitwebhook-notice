@@ -1,22 +1,34 @@
 import crypto from "crypto";
 import { createClient } from "redis";
 
-export const config = { runtime: "nodejs" };
+export const config = {
+  runtime: "nodejs"
+};
 
 const processedEvents = new Map();
 const workflowMessageMap = new Map();
 
-const EVENT_DEDUP_TTL_MS = 6 * 60 * 60 * 1000;
-const WORKFLOW_MESSAGE_TTL_MS = 24 * 60 * 60 * 1000;
+const EVENT_DEDUP_TTL_MS =
+  6 * 60 * 60 * 1000;
 
-const EVENT_DEDUP_TTL_SECONDS = EVENT_DEDUP_TTL_MS / 1000;
-const WORKFLOW_MESSAGE_TTL_SECONDS = WORKFLOW_MESSAGE_TTL_MS / 1000;
+const WORKFLOW_MESSAGE_TTL_MS =
+  24 * 60 * 60 * 1000;
+
+const EVENT_DEDUP_TTL_SECONDS =
+  EVENT_DEDUP_TTL_MS / 1000;
+
+const WORKFLOW_MESSAGE_TTL_SECONDS =
+  WORKFLOW_MESSAGE_TTL_MS / 1000;
 
 let redisClient;
 let redisConnectPromise;
 
 function getRedisUrl() {
-  return process.env.webhook_REDIS_URL || process.env.REDIS_URL || null;
+  return (
+    process.env.webhook_REDIS_URL ||
+    process.env.REDIS_URL ||
+    null
+  );
 }
 
 function canUseRedis() {
@@ -34,7 +46,10 @@ async function getRedisClient() {
     });
 
     redisClient.on("error", (error) => {
-      console.error("Redis error:", error);
+      console.error(
+        "Redis error:",
+        error
+      );
     });
   }
 
@@ -43,15 +58,19 @@ async function getRedisClient() {
   }
 
   if (!redisConnectPromise) {
-    redisConnectPromise = redisClient
-      .connect()
-      .catch((error) => {
-        redisConnectPromise = null;
-        throw error;
-      })
-      .then(() => {
-        redisConnectPromise = null;
-      });
+    redisConnectPromise =
+      redisClient
+        .connect()
+        .catch((error) => {
+          redisConnectPromise =
+            null;
+
+          throw error;
+        })
+        .then(() => {
+          redisConnectPromise =
+            null;
+        });
   }
 
   await redisConnectPromise;
@@ -63,24 +82,42 @@ function cleanupMap(map, ttl) {
   const now = Date.now();
 
   for (const [key, value] of map.entries()) {
-    if (now - value.updatedAt > ttl) {
+    if (
+      now - value.updatedAt >
+      ttl
+    ) {
       map.delete(key);
     }
   }
 }
 
 function buildEventKey(req) {
-  const event = req.headers["x-github-event"];
-  const delivery = req.headers["x-github-delivery"] || "no-delivery";
-  const action = req.body?.action || "no-action";
+  const event =
+    req.headers["x-github-event"];
+
+  const delivery =
+    req.headers[
+      "x-github-delivery"
+    ] || "no-delivery";
+
+  const action =
+    req.body?.action ||
+    "no-action";
 
   return `${event}:${delivery}:${action}`;
 }
 
-function isDuplicateEventInMemory(eventKey) {
-  cleanupMap(processedEvents, EVENT_DEDUP_TTL_MS);
+function isDuplicateEventInMemory(
+  eventKey
+) {
+  cleanupMap(
+    processedEvents,
+    EVENT_DEDUP_TTL_MS
+  );
 
-  if (processedEvents.has(eventKey)) {
+  if (
+    processedEvents.has(eventKey)
+  ) {
     return true;
   }
 
@@ -91,37 +128,52 @@ function isDuplicateEventInMemory(eventKey) {
   return false;
 }
 
-async function isDuplicateEvent(eventKey) {
-  const redis = await getRedisClient();
+async function isDuplicateEvent(
+  eventKey
+) {
+  const redis =
+    await getRedisClient();
 
   if (!redis) {
-    return isDuplicateEventInMemory(eventKey);
+    return isDuplicateEventInMemory(
+      eventKey
+    );
   }
 
   const key = `github:dedup:${eventKey}`;
 
-  const result = await redis.set(key, "1", {
-    EX: EVENT_DEDUP_TTL_SECONDS,
-    NX: true
-  });
+  const result = await redis.set(
+    key,
+    "1",
+    {
+      EX: EVENT_DEDUP_TTL_SECONDS,
+      NX: true
+    }
+  );
 
   return result !== "OK";
 }
 
-async function telegramRequest(botToken, method, payload) {
+async function telegramRequest(
+  botToken,
+  method,
+  payload
+) {
   const response = await fetch(
     `https://api.telegram.org/bot${botToken}/${method}`,
     {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type":
+          "application/json"
       },
       body: JSON.stringify(payload)
     }
   );
 
   if (!response.ok) {
-    const errorText = await response.text();
+    const errorText =
+      await response.text();
 
     throw new Error(
       `Telegram API ${method} failed: ${response.status} ${errorText}`
@@ -139,15 +191,22 @@ function mapWorkflowStatus(wf) {
     };
   }
 
-  if (wf.status === "in_progress") {
+  if (
+    wf.status === "in_progress"
+  ) {
     return {
       label: "building",
       emoji: "🛠️"
     };
   }
 
-  if (wf.status === "completed") {
-    if (wf.conclusion === "success") {
+  if (
+    wf.status === "completed"
+  ) {
+    if (
+      wf.conclusion ===
+      "success"
+    ) {
       return {
         label: "success",
         emoji: "✅"
@@ -155,7 +214,9 @@ function mapWorkflowStatus(wf) {
     }
 
     return {
-      label: wf.conclusion || "failure",
+      label:
+        wf.conclusion ||
+        "failure",
       emoji: "❌"
     };
   }
@@ -163,8 +224,14 @@ function mapWorkflowStatus(wf) {
   return null;
 }
 
-function formatDuration(startedAt, endedAt) {
-  if (!startedAt || !endedAt) {
+function formatDuration(
+  startedAt,
+  endedAt
+) {
+  if (
+    !startedAt ||
+    !endedAt
+  ) {
     return "-";
   }
 
@@ -172,19 +239,32 @@ function formatDuration(startedAt, endedAt) {
     new Date(endedAt).getTime() -
     new Date(startedAt).getTime();
 
-  if (Number.isNaN(ms) || ms < 0) {
+  if (
+    Number.isNaN(ms) ||
+    ms < 0
+  ) {
     return "-";
   }
 
-  const totalSeconds = Math.floor(ms / 1000);
+  const totalSeconds =
+    Math.floor(ms / 1000);
 
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
+  const minutes =
+    Math.floor(
+      totalSeconds / 60
+    );
+
+  const seconds =
+    totalSeconds % 60;
 
   return `${minutes}m ${seconds}s`;
 }
 
-function formatWorkflowMessage(repository, wf, status) {
+function formatWorkflowMessage(
+  repository,
+  wf,
+  status
+) {
   const duration =
     wf.status === "completed"
       ? formatDuration(
@@ -199,31 +279,48 @@ Repo: ${repository.full_name}
 Branch: ${wf.head_branch}
 Workflow: ${wf.name}
 Status: ${status.label}
-Actor: ${wf.actor?.login || "unknown"}
-Commit: ${wf.head_commit?.id?.slice(0, 7) || "-"}
+Actor: ${
+    wf.actor?.login ||
+    "unknown"
+  }
+Commit: ${
+    wf.head_commit?.id?.slice(
+      0,
+      7
+    ) || "-"
+  }
 Duration: ${duration}
 
 ${wf.html_url}`;
 }
 
-function shouldTrackWorkflow(name) {
+function shouldTrackWorkflow(
+  name
+) {
   const workflowFilter =
-    process.env.WORKFLOW_NAME_FILTER;
+    process.env
+      .WORKFLOW_NAME_FILTER;
 
-  // If no filter set, allow all workflows
+  // No filter = all workflows
   if (!workflowFilter) {
     return true;
   }
 
   return name
     .toLowerCase()
-    .includes(workflowFilter.toLowerCase());
+    .includes(
+      workflowFilter.toLowerCase()
+    );
 }
 
-async function getWorkflowTracking(workflowRunId, chatId) {
+async function getWorkflowTracking(
+  workflowRunId,
+  chatId
+) {
   const key = `github:workflow:${workflowRunId}:${chatId}`;
 
-  const redis = await getRedisClient();
+  const redis =
+    await getRedisClient();
 
   if (!redis) {
     cleanupMap(
@@ -238,9 +335,12 @@ async function getWorkflowTracking(workflowRunId, chatId) {
     );
   }
 
-  const raw = await redis.get(key);
+  const raw =
+    await redis.get(key);
 
-  return raw ? JSON.parse(raw) : null;
+  return raw
+    ? JSON.parse(raw)
+    : null;
 }
 
 async function saveWorkflowTracking(
@@ -250,7 +350,8 @@ async function saveWorkflowTracking(
 ) {
   const key = `github:workflow:${workflowRunId}:${chatId}`;
 
-  const redis = await getRedisClient();
+  const redis =
+    await getRedisClient();
 
   if (!redis) {
     workflowMessageMap.set(
@@ -266,7 +367,9 @@ async function saveWorkflowTracking(
 
   await redis.set(
     key,
-    JSON.stringify(trackingData),
+    JSON.stringify(
+      trackingData
+    ),
     {
       EX: WORKFLOW_MESSAGE_TTL_SECONDS
     }
@@ -291,24 +394,30 @@ async function upsertWorkflowNotification(
     );
 
   if (!tracked) {
-    const created = await telegramRequest(
-      botToken,
-      "sendMessage",
-      {
-        chat_id: chatId,
-        text: message,
-        disable_web_page_preview: true
-      }
-    );
+    const created =
+      await telegramRequest(
+        botToken,
+        "sendMessage",
+        {
+          chat_id: chatId,
+          text: message,
+          disable_web_page_preview:
+            true
+        }
+      );
 
     await saveWorkflowTracking(
       workflowRun.id,
       chatId,
       {
-        messageId: created.result?.message_id,
-        lastStatus: workflowRun.status,
+        messageId:
+          created.result
+            ?.message_id,
+        lastStatus:
+          workflowRun.status,
         lastConclusion:
-          workflowRun.conclusion || null
+          workflowRun.conclusion ||
+          null
       }
     );
 
@@ -316,13 +425,18 @@ async function upsertWorkflowNotification(
   }
 
   const sameStatus =
-    tracked.lastStatus === workflowRun.status;
+    tracked.lastStatus ===
+    workflowRun.status;
 
   const sameConclusion =
     tracked.lastConclusion ===
-    (workflowRun.conclusion || null);
+    (workflowRun.conclusion ||
+      null);
 
-  if (sameStatus && sameConclusion) {
+  if (
+    sameStatus &&
+    sameConclusion
+  ) {
     return;
   }
 
@@ -332,34 +446,42 @@ async function upsertWorkflowNotification(
       "editMessageText",
       {
         chat_id: chatId,
-        message_id: tracked.messageId,
+        message_id:
+          tracked.messageId,
         text: message,
-        disable_web_page_preview: true
+        disable_web_page_preview:
+          true
       }
     );
   } else {
-    const created = await telegramRequest(
-      botToken,
-      "sendMessage",
-      {
-        chat_id: chatId,
-        text: message,
-        disable_web_page_preview: true
-      }
-    );
+    const created =
+      await telegramRequest(
+        botToken,
+        "sendMessage",
+        {
+          chat_id: chatId,
+          text: message,
+          disable_web_page_preview:
+            true
+        }
+      );
 
     tracked.messageId =
-      created.result?.message_id;
+      created.result
+        ?.message_id;
   }
 
   await saveWorkflowTracking(
     workflowRun.id,
     chatId,
     {
-      messageId: tracked.messageId,
-      lastStatus: workflowRun.status,
+      messageId:
+        tracked.messageId,
+      lastStatus:
+        workflowRun.status,
       lastConclusion:
-        workflowRun.conclusion || null
+        workflowRun.conclusion ||
+        null
     }
   );
 }
@@ -386,23 +508,32 @@ async function sendToAllChats(
   }
 }
 
-export default async function handler(req, res) {
+export default async function handler(
+  req,
+  res
+) {
   try {
     const BOT_TOKEN =
       process.env.BOT_TOKEN;
 
     const CHAT_IDS = (
-      process.env.CHAT_ID || ""
+      process.env.CHAT_ID ||
+      ""
     )
       .split(",")
-      .map((id) => id.trim())
+      .map((id) =>
+        id.trim()
+      )
       .filter(Boolean);
 
     const SECRET =
-      process.env.WEBHOOK_SECRET;
+      process.env
+        .WEBHOOK_SECRET;
 
     const ALLOWED_BRANCH =
-      process.env.ALLOWED_BRANCH || "main";
+      process.env
+        .ALLOWED_BRANCH ||
+      "main";
 
     if (
       !BOT_TOKEN ||
@@ -411,21 +542,30 @@ export default async function handler(req, res) {
     ) {
       return res
         .status(500)
-        .send("Missing environment variables");
+        .send(
+          "Missing environment variables"
+        );
     }
 
     const signature =
-      req.headers["x-hub-signature-256"];
+      req.headers[
+        "x-hub-signature-256"
+      ];
 
     const event =
-      req.headers["x-github-event"];
+      req.headers[
+        "x-github-event"
+      ];
 
-    const raw = JSON.stringify(req.body);
-
-    const hmac = crypto.createHmac(
-      "sha256",
-      SECRET
+    const raw = JSON.stringify(
+      req.body
     );
+
+    const hmac =
+      crypto.createHmac(
+        "sha256",
+        SECRET
+      );
 
     const digest = `sha256=${hmac
       .update(raw)
@@ -437,18 +577,24 @@ export default async function handler(req, res) {
     ) {
       return res
         .status(401)
-        .send("Invalid signature");
+        .send(
+          "Invalid signature"
+        );
     }
 
     const eventKey =
       buildEventKey(req);
 
     if (
-      await isDuplicateEvent(eventKey)
+      await isDuplicateEvent(
+        eventKey
+      )
     ) {
       return res
         .status(200)
-        .send("Duplicate webhook ignored");
+        .send(
+          "Duplicate webhook ignored"
+        );
     }
 
     // ================= PUSH =================
@@ -460,15 +606,23 @@ export default async function handler(req, res) {
           ""
         );
 
-      if (branch !== ALLOWED_BRANCH) {
-        return res.status(200).end();
+      if (
+        branch !==
+        ALLOWED_BRANCH
+      ) {
+        return res
+          .status(200)
+          .end();
       }
 
       const repo =
-        req.body.repository.full_name;
+        req.body.repository
+          .full_name;
 
       const commits =
-        req.body.commits.slice(-3);
+        req.body.commits.slice(
+          -3
+        );
 
       const pushUrl =
         req.body.compare;
@@ -497,14 +651,18 @@ ${pushUrl}`;
         (chatId) => ({
           chat_id: chatId,
           text,
-          disable_web_page_preview: false
+          disable_web_page_preview:
+            false
         })
       );
     }
 
     // ================= WORKFLOW RUN =================
 
-    if (event === "workflow_run") {
+    if (
+      event ===
+      "workflow_run"
+    ) {
       const wf =
         req.body.workflow_run;
 
@@ -513,21 +671,29 @@ ${pushUrl}`;
           wf.name
         )
       ) {
-        return res.status(200).end();
+        return res
+          .status(200)
+          .end();
       }
 
       if (
         wf.head_branch !==
         ALLOWED_BRANCH
       ) {
-        return res.status(200).end();
+        return res
+          .status(200)
+          .end();
       }
 
       const status =
-        mapWorkflowStatus(wf);
+        mapWorkflowStatus(
+          wf
+        );
 
       if (!status) {
-        return res.status(200).end();
+        return res
+          .status(200)
+          .end();
       }
 
       const message =
@@ -547,10 +713,17 @@ ${pushUrl}`;
       }
     }
 
-    return res.status(200).end();
+    return res
+      .status(200)
+      .end();
   } catch (error) {
     console.error(error);
 
-    return res.status(500).end();
+    return res
+      .status(500)
+      .send(
+        error?.message ||
+          "Internal Server Error"
+      );
   }
-    }
+}
