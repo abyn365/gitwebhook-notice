@@ -513,6 +513,21 @@ export default async function handler(
   res
 ) {
   try {
+    const event =
+      req.headers[
+        "x-github-event"
+      ];
+
+    // Handle GitHub webhook ping
+    if (event === "ping") {
+      return res
+        .status(200)
+        .json({
+          ok: true,
+          message: "pong"
+        });
+    }
+
     const BOT_TOKEN =
       process.env.BOT_TOKEN;
 
@@ -550,11 +565,6 @@ export default async function handler(
     const signature =
       req.headers[
         "x-hub-signature-256"
-      ];
-
-    const event =
-      req.headers[
-        "x-github-event"
       ];
 
     const raw = JSON.stringify(
