@@ -2,12 +2,17 @@
  * api/bot.js — Telegram admin dashboard bot
  *
  * Set your bot's webhook to: https://<your-vercel-url>/api/bot
- *   curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<host>/api/bot"
+ *   curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+ *     -H "Content-Type: application/json" \
+ *     -d '{"url":"https://<host>/api/bot","secret_token":"<WEBHOOK_SECRET>","allowed_updates":["message","callback_query"]}'
  *
  * Required env vars:
  *   BOT_TOKEN          — shared with github.js
  *   ADMIN_USER_IDS     — comma-separated Telegram user IDs allowed to use this bot
  *   DASHBOARD_PASSWORD — password required after user-ID check
+ *
+ * Recommended for group routing:
+ *   BOT_USERNAME       — bot username without @, e.g. abyngithubBot
  *
  * Optional (for config editing):
  *   VERCEL_TOKEN       — Vercel API token
@@ -42,7 +47,7 @@ const ALL_EVENTS = [
 ];
 
 const EDITABLE_KEYS = [
-  "BOT_TOKEN", "CHAT_ID", "WEBHOOK_SECRET", "REDIS_URL",
+  "BOT_TOKEN", "BOT_USERNAME", "CHAT_ID", "WEBHOOK_SECRET", "REDIS_URL",
   "ALLOWED_REPOS", "ALLOWED_BRANCH", "WORKFLOW_NAME_FILTER",
   "ONLY_FAILURES", "SILENT_LOW_PRIORITY", "DISABLED_EVENTS",
 ];
@@ -56,6 +61,66 @@ const ADMIN_PASSWORD = () => (process.env.DASHBOARD_PASSWORD || "").trim();
 const VERCEL_TOKEN   = () => (process.env.VERCEL_TOKEN || "").trim();
 const VERCEL_PROJECT = () => (process.env.VERCEL_PROJECT_ID || "").trim();
 const VERCEL_TEAM    = () => (process.env.VERCEL_TEAM_ID || "").trim();
+const BOT_USERNAME   = () => (process.env.BOT_USERNAME || "").trim().replace(/^@/, "");
+
+
+const GROUP_CHAT_TYPES = new Set(["group", "supergroup"]);
+const DIRECT_COMMANDS = new Set(["start", "login", "menu", "help", "cancel"]);
+
+let _botUsername = BOT_USERNAME() || null;
+
+function isGroupChat(chat) {
+  return GROUP_CHAT_TYPES.has(chat?.type);
+}
+
+function parseCommand(text = "") {
+  const match = text.trim().match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  return {
+    name: match[1].toLowerCase(),
+    target: match[2]?.toLowerCase() || null,
+    args: (match[3] || "").trim(),
+  };
+}
+
+function knownBotUsername() {
+  return (BOT_USERNAME() || _botUsername || "").toLowerCase();
+}
+
+function isDirectCommandForThisBot(command) {
+  if (!command || !DIRECT_COMMANDS.has(command.name)) return false;
+  if (!command.target) return true;
+
+  const known = knownBotUsername();
+  // If BOT_USERNAME is not configured and getMe has not been cached yet, trust
+  // Telegram's webhook routing instead of blocking the command on a network call.
+  return known ? command.target === known : true;
+}
+
+async function ensureBotUsername() {
+  if (_botUsername || !BOT_TOKEN()) return _botUsername;
+  try {
+    if (BOT_USERNAME()) {
+      _botUsername = BOT_USERNAME();
+      return _botUsername;
+    }
+
+    const redis = await getRedis();
+    const cached = await redis?.get("admin:bot_username").catch(() => null);
+    if (cached) {
+      _botUsername = cached;
+      return _botUsername;
+    }
+
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN()}/getMe`, { signal: AbortSignal.timeout(2_000) });
+    const d = await r.json();
+    if (d.ok && d.result?.username) {
+      _botUsername = d.result.username;
+      await redis?.set("admin:bot_username", _botUsername, { EX: 24 * 60 * 60 }).catch(() => {});
+    }
+  } catch {}
+  return _botUsername;
+}
 
 
 const GROUP_CHAT_TYPES = new Set(["group", "supergroup"]);
@@ -375,6 +440,7 @@ function configSummary() {
   return `<b>⚙️ Current Configuration</b>
 
 ${dot(!!process.env.BOT_TOKEN)} <b>BOT_TOKEN</b>: ${process.env.BOT_TOKEN ? "configured" : "missing"}
+${dot(!!BOT_USERNAME())} <b>BOT_USERNAME</b>: ${BOT_USERNAME() ? `<code>${esc(BOT_USERNAME())}</code>` : "recommended for groups"}
 ${dot(chats.length > 0)} <b>CHAT_ID</b>: ${chats.length ? chats.map(c => `<code>${esc(c)}</code>`).join(", ") : "missing"}
 ${dot(!!process.env.WEBHOOK_SECRET)} <b>WEBHOOK_SECRET</b>: ${process.env.WEBHOOK_SECRET ? "configured" : "missing"}
 ${dot(hasRedis)} <b>Redis</b>: ${hasRedis ? "connected" : "in-memory fallback"}
@@ -496,6 +562,12 @@ function eventsMenu(disabled = new Set()) {
   }
   rows.push([{ text: "← Back", callback_data: "home" }]);
   return kb(rows);
+}
+
+
+function authPromptText(groupChat = false) {
+  const command = groupChat ? "/start &lt;password&gt;" : "your dashboard password";
+  return `🔐 <b>gh-notify Admin</b>\n\nYou're on the allow-list. Enter ${command} to continue.`;
 }
 
 // ─── handlers ────────────────────────────────────────────────────────────────
@@ -741,8 +813,6 @@ export default async function handler(req, res) {
     return res.status(401).end();
   }
 
-  res.status(200).end(); // Acknowledge immediately — Telegram retries on timeout
-
   try {
     const update = req.body;
 
@@ -811,8 +881,10 @@ export default async function handler(req, res) {
       const command = parseCommand(text);
       const groupChat = isGroupChat(msg.chat);
 
-      if (command?.target) await ensureBotUsername();
       const directCommand = isDirectCommandForThisBot(command);
+      if (command?.target && directCommand && !knownBotUsername()) {
+        ensureBotUsername().catch(() => {});
+      }
 
       // Ignore GIFs, stickers, photos, and ordinary group chatter. This keeps the
       // admin bot quiet in groups unless an admin explicitly sends a bot command.
@@ -830,12 +902,13 @@ export default async function handler(req, res) {
       }
 
       if (directCommand && (command.name === "start" || command.name === "login")) {
-        if (await isAuthenticated(userId)) {
+        const authenticated = await isAuthenticated(userId);
+        if (authenticated) {
           await send(chatId, "✅ You're already signed in.", mainMenu());
+        } else if (command.args) {
+          await handleAuth(chatId, userId, command.args);
         } else {
-          await send(chatId,
-            `🔐 <b>gh-notify Admin</b>\n\nYou're on the allow-list. Enter your dashboard password to continue.`
-          );
+          await send(chatId, authPromptText(groupChat));
         }
         return;
       }
@@ -850,7 +923,7 @@ export default async function handler(req, res) {
 
       if (directCommand && (command.name === "menu" || command.name === "help")) {
         if (!authenticated) {
-          await send(chatId, "🔒 Session expired. Send /start to log in again.");
+          await send(chatId, authPromptText(groupChat));
           return;
         }
         await handleHome(chatId);
@@ -877,5 +950,9 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error("Bot handler error:", err);
+  } finally {
+    if (!res.headersSent) {
+      res.status(200).end();
+    }
   }
 }
