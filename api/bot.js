@@ -122,6 +122,47 @@ async function ensureBotUsername() {
   return _botUsername;
 }
 
+
+const GROUP_CHAT_TYPES = new Set(["group", "supergroup"]);
+const DIRECT_COMMANDS = new Set(["start", "login", "menu", "help", "cancel"]);
+
+let _botUsername = null;
+
+function isGroupChat(chat) {
+  return GROUP_CHAT_TYPES.has(chat?.type);
+}
+
+function parseCommand(text = "") {
+  const match = text.trim().match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s|$)/);
+  if (!match) return null;
+  return { name: match[1].toLowerCase(), target: match[2]?.toLowerCase() || null };
+}
+
+function isDirectCommandForThisBot(command) {
+  if (!command || !DIRECT_COMMANDS.has(command.name)) return false;
+  return !command.target || !_botUsername || command.target === _botUsername.toLowerCase();
+}
+
+async function ensureBotUsername() {
+  if (_botUsername || !BOT_TOKEN()) return _botUsername;
+  try {
+    const redis = await getRedis();
+    const cached = await redis?.get("admin:bot_username").catch(() => null);
+    if (cached) {
+      _botUsername = cached;
+      return _botUsername;
+    }
+
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN()}/getMe`, { signal: AbortSignal.timeout(2_000) });
+    const d = await r.json();
+    if (d.ok && d.result?.username) {
+      _botUsername = d.result.username;
+      await redis?.set("admin:bot_username", _botUsername, { EX: 24 * 60 * 60 }).catch(() => {});
+    }
+  } catch {}
+  return _botUsername;
+}
+
 function getAdminUserIds() {
   return (process.env.ADMIN_USER_IDS || "")
     .split(",").map(v => v.trim()).filter(Boolean).map(Number).filter(Boolean);
