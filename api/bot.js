@@ -2,12 +2,17 @@
  * api/bot.js — Telegram admin dashboard bot
  *
  * Set your bot's webhook to: https://<your-vercel-url>/api/bot
- *   curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<host>/api/bot"
+ *   curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+ *     -H "Content-Type: application/json" \
+ *     -d '{"url":"https://<host>/api/bot","secret_token":"<WEBHOOK_SECRET>","allowed_updates":["message","callback_query"]}'
  *
  * Required env vars:
  *   BOT_TOKEN          — shared with github.js
  *   ADMIN_USER_IDS     — comma-separated Telegram user IDs allowed to use this bot
  *   DASHBOARD_PASSWORD — password required after user-ID check
+ *
+ * Recommended for group routing:
+ *   BOT_USERNAME       — bot username without @, e.g. abyngithubBot
  *
  * Optional (for config editing):
  *   VERCEL_TOKEN       — Vercel API token
@@ -26,8 +31,10 @@ export const config = { runtime: "nodejs" };
 
 const SESSION_TTL_S  = 8 * 60 * 60;      // 8 hours
 const SESSION_KEY    = (uid) => `admin:session:${uid}`;
-const PENDING_KEY    = (uid) => `admin:pending_edit:${uid}`;
+const PENDING_KEY    = (uid, chatId) => `admin:pending_edit:${uid}:${chatId}`;
+const LEGACY_PENDING_KEY = (uid) => `admin:pending_edit:${uid}`;
 const ACTIVITY_KEY   = "github:activity_log";
+const RUNTIME_CONFIG_KEY = "admin:runtime_config";
 
 const ALL_EVENTS = [
   "push", "pull_request", "issues", "issue_comment", "workflow_run",
@@ -40,7 +47,7 @@ const ALL_EVENTS = [
 ];
 
 const EDITABLE_KEYS = [
-  "BOT_TOKEN", "CHAT_ID", "WEBHOOK_SECRET", "REDIS_URL",
+  "BOT_TOKEN", "BOT_USERNAME", "CHAT_ID", "WEBHOOK_SECRET", "REDIS_URL",
   "ALLOWED_REPOS", "ALLOWED_BRANCH", "WORKFLOW_NAME_FILTER",
   "ONLY_FAILURES", "SILENT_LOW_PRIORITY", "DISABLED_EVENTS",
 ];
@@ -54,6 +61,66 @@ const ADMIN_PASSWORD = () => (process.env.DASHBOARD_PASSWORD || "").trim();
 const VERCEL_TOKEN   = () => (process.env.VERCEL_TOKEN || "").trim();
 const VERCEL_PROJECT = () => (process.env.VERCEL_PROJECT_ID || "").trim();
 const VERCEL_TEAM    = () => (process.env.VERCEL_TEAM_ID || "").trim();
+const BOT_USERNAME   = () => (process.env.BOT_USERNAME || "").trim().replace(/^@/, "");
+
+
+const GROUP_CHAT_TYPES = new Set(["group", "supergroup"]);
+const DIRECT_COMMANDS = new Set(["start", "login", "menu", "help", "cancel"]);
+
+let _botUsername = BOT_USERNAME() || null;
+
+function isGroupChat(chat) {
+  return GROUP_CHAT_TYPES.has(chat?.type);
+}
+
+function parseCommand(text = "") {
+  const match = text.trim().match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  return {
+    name: match[1].toLowerCase(),
+    target: match[2]?.toLowerCase() || null,
+    args: (match[3] || "").trim(),
+  };
+}
+
+function knownBotUsername() {
+  return (BOT_USERNAME() || _botUsername || "").toLowerCase();
+}
+
+function isDirectCommandForThisBot(command) {
+  if (!command || !DIRECT_COMMANDS.has(command.name)) return false;
+  if (!command.target) return true;
+
+  const known = knownBotUsername();
+  // If BOT_USERNAME is not configured and getMe has not been cached yet, trust
+  // Telegram's webhook routing instead of blocking the command on a network call.
+  return known ? command.target === known : true;
+}
+
+async function ensureBotUsername() {
+  if (_botUsername || !BOT_TOKEN()) return _botUsername;
+  try {
+    if (BOT_USERNAME()) {
+      _botUsername = BOT_USERNAME();
+      return _botUsername;
+    }
+
+    const redis = await getRedis();
+    const cached = await redis?.get("admin:bot_username").catch(() => null);
+    if (cached) {
+      _botUsername = cached;
+      return _botUsername;
+    }
+
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN()}/getMe`, { signal: AbortSignal.timeout(2_000) });
+    const d = await r.json();
+    if (d.ok && d.result?.username) {
+      _botUsername = d.result.username;
+      await redis?.set("admin:bot_username", _botUsername, { EX: 24 * 60 * 60 }).catch(() => {});
+    }
+  } catch {}
+  return _botUsername;
+}
 
 function getAdminUserIds() {
   return (process.env.ADMIN_USER_IDS || "")
@@ -146,29 +213,63 @@ async function clearAuthenticated(userId) {
 
 const _memPending = new Map();
 
-async function setPending(userId, data) {
-  const val = JSON.stringify(data);
-  _memPending.set(userId, { data, exp: Date.now() + 300_000 });
-  const redis = await getRedis();
-  if (redis) await redis.set(PENDING_KEY(userId), val, { EX: 300 }).catch(() => {});
+function pendingMemoryKey(userId, chatId) {
+  return `${userId}:${chatId}`;
 }
 
-async function getPending(userId) {
-  const entry = _memPending.get(userId);
+async function setPending(userId, chatId, data) {
+  const val = JSON.stringify(data);
+  _memPending.set(pendingMemoryKey(userId, chatId), { data, exp: Date.now() + 300_000 });
+  const redis = await getRedis();
+  if (redis) await redis.set(PENDING_KEY(userId, chatId), val, { EX: 300 }).catch(() => {});
+}
+
+async function getPending(userId, chatId) {
+  const entry = _memPending.get(pendingMemoryKey(userId, chatId));
   if (entry && Date.now() <= entry.exp) return entry.data;
 
   const redis = await getRedis();
   if (redis) {
-    const v = await redis.get(PENDING_KEY(userId)).catch(() => null);
-    return v ? JSON.parse(v) : null;
+    const v = await redis.get(PENDING_KEY(userId, chatId)).catch(() => null);
+    if (v) return JSON.parse(v);
+
+    // Backward compatibility for edits started before pending state was scoped by chat.
+    const legacy = await redis.get(LEGACY_PENDING_KEY(userId)).catch(() => null);
+    return legacy ? JSON.parse(legacy) : null;
   }
   return null;
 }
 
-async function clearPending(userId) {
-  _memPending.delete(userId);
+async function clearPending(userId, chatId) {
+  _memPending.delete(pendingMemoryKey(userId, chatId));
   const redis = await getRedis();
-  if (redis) await redis.del(PENDING_KEY(userId)).catch(() => {});
+  if (redis) {
+    await redis.del([PENDING_KEY(userId, chatId), LEGACY_PENDING_KEY(userId)]).catch(() => {});
+  }
+}
+
+
+async function setRuntimeConfig(key, value) {
+  const redis = await getRedis();
+  if (!redis) return false;
+  if (value === "") {
+    await redis.hDel(RUNTIME_CONFIG_KEY, key).catch(() => {});
+  } else {
+    await redis.hSet(RUNTIME_CONFIG_KEY, key, value).catch(() => {});
+  }
+  return true;
+}
+
+async function getRuntimeConfig(key) {
+  const redis = await getRedis();
+  if (!redis) return null;
+  return redis.hGet(RUNTIME_CONFIG_KEY, key).catch(() => null);
+}
+
+async function getDisabledEvents() {
+  const stored = await getRuntimeConfig("DISABLED_EVENTS");
+  const raw = stored ?? process.env.DISABLED_EVENTS ?? "";
+  return new Set(raw.split(",").map(s => s.trim()).filter(Boolean));
 }
 
 // ─── activity log ─────────────────────────────────────────────────────────────
@@ -298,6 +399,7 @@ function configSummary() {
   return `<b>⚙️ Current Configuration</b>
 
 ${dot(!!process.env.BOT_TOKEN)} <b>BOT_TOKEN</b>: ${process.env.BOT_TOKEN ? "configured" : "missing"}
+${dot(!!BOT_USERNAME())} <b>BOT_USERNAME</b>: ${BOT_USERNAME() ? `<code>${esc(BOT_USERNAME())}</code>` : "recommended for groups"}
 ${dot(chats.length > 0)} <b>CHAT_ID</b>: ${chats.length ? chats.map(c => `<code>${esc(c)}</code>`).join(", ") : "missing"}
 ${dot(!!process.env.WEBHOOK_SECRET)} <b>WEBHOOK_SECRET</b>: ${process.env.WEBHOOK_SECRET ? "configured" : "missing"}
 ${dot(hasRedis)} <b>Redis</b>: ${hasRedis ? "connected" : "in-memory fallback"}
@@ -406,10 +508,7 @@ function editMenu() {
   return kb(rows);
 }
 
-function eventsMenu() {
-  const disabled = new Set(
-    (process.env.DISABLED_EVENTS || "").split(",").map(s => s.trim()).filter(Boolean)
-  );
+function eventsMenu(disabled = new Set()) {
   const rows = [];
   for (let i = 0; i < ALL_EVENTS.length; i += 2) {
     const row = [];
@@ -422,6 +521,12 @@ function eventsMenu() {
   }
   rows.push([{ text: "← Back", callback_data: "home" }]);
   return kb(rows);
+}
+
+
+function authPromptText(groupChat = false) {
+  const command = groupChat ? "/start &lt;password&gt;" : "your dashboard password";
+  return `🔐 <b>gh-notify Admin</b>\n\nYou're on the allow-list. Enter ${command} to continue.`;
 }
 
 // ─── handlers ────────────────────────────────────────────────────────────────
@@ -482,19 +587,15 @@ async function handleActivity(chatId, messageId) {
 }
 
 async function handleEvents(chatId, messageId) {
-  const disabled = new Set(
-    (process.env.DISABLED_EVENTS || "").split(",").map(s => s.trim()).filter(Boolean)
-  );
-  const text = `<b>🔔 Event Toggles</b>\n\n🟢 = enabled (will notify)  🔴 = disabled\n\n<b>Disabled events:</b> ${disabled.size ? [...disabled].map(e=>`<code>${esc(e)}</code>`).join(", ") : "none"}\n\n<i>Tap an event to toggle it on/off. Changes are saved immediately via Vercel API.</i>`;
-  await edit(chatId, messageId, text, eventsMenu());
+  const disabled = await getDisabledEvents();
+  const text = `<b>🔔 Event Toggles</b>\n\n🟢 = enabled (will notify)  🔴 = disabled\n\n<b>Disabled events:</b> ${disabled.size ? [...disabled].map(e=>`<code>${esc(e)}</code>`).join(", ") : "none"}\n\n<i>Tap an event to toggle it on/off. Changes are saved immediately in Redis and mirrored to Vercel when configured.</i>`;
+  await edit(chatId, messageId, text, eventsMenu(disabled));
 }
 
 async function handleToggleEvent(chatId, messageId, callbackId, eventName) {
   const hasVercel = !!(VERCEL_TOKEN() && VERCEL_PROJECT());
 
-  const disabled = new Set(
-    (process.env.DISABLED_EVENTS || "").split(",").map(s => s.trim()).filter(Boolean)
-  );
+  const disabled = await getDisabledEvents();
 
   if (disabled.has(eventName)) {
     disabled.delete(eventName);
@@ -503,6 +604,8 @@ async function handleToggleEvent(chatId, messageId, callbackId, eventName) {
   }
 
   const newValue = [...disabled].join(",");
+  const savedToRedis = await setRuntimeConfig("DISABLED_EVENTS", newValue);
+  process.env.DISABLED_EVENTS = newValue;
 
   if (hasVercel) {
     try {
@@ -511,17 +614,12 @@ async function handleToggleEvent(chatId, messageId, callbackId, eventName) {
       } else {
         await vercelDeleteEnv("DISABLED_EVENTS");
       }
-      // Update runtime env so subsequent reads in this process are correct
-      process.env.DISABLED_EVENTS = newValue;
       await answerCallback(callbackId, disabled.has(eventName) ? `🔴 ${eventName} disabled` : `🟢 ${eventName} enabled`);
     } catch (err) {
-      await answerCallback(callbackId, `Error: ${err.message}`);
-      return;
+      await answerCallback(callbackId, `Saved in Redis; Vercel error: ${err.message}`);
     }
   } else {
-    // No Vercel API — update in-process only (survives this invocation)
-    process.env.DISABLED_EVENTS = newValue;
-    await answerCallback(callbackId, "⚠️ No Vercel API — change is temporary");
+    await answerCallback(callbackId, savedToRedis ? "Saved in Redis runtime config" : "⚠️ Temporary — Redis not configured");
   }
 
   await handleEvents(chatId, messageId);
@@ -543,7 +641,7 @@ async function handleEditMenu(chatId, messageId) {
 }
 
 async function handleEditKey(chatId, messageId, userId, key) {
-  await setPending(userId, { key, promptMessageId: messageId });
+  await setPending(userId, chatId, { key, promptMessageId: messageId });
   const isSensitive = SENSITIVE.has(key);
   const current = isSensitive
     ? "(hidden)"
@@ -578,17 +676,17 @@ async function handleToggle(chatId, messageId, callbackId, key) {
 }
 
 async function handlePendingEdit(chatId, messageId, userId, text) {
-  const pending = await getPending(userId);
+  const pending = await getPending(userId, chatId);
   if (!pending) return false; // not in edit mode
 
   if (text === "/cancel") {
-    await clearPending(userId);
+    await clearPending(userId, chatId);
     await send(chatId, "❌ Edit cancelled.", mainMenu());
     return true;
   }
 
   const { key } = pending;
-  await clearPending(userId);
+  await clearPending(userId, chatId);
 
   const newValue = text === "-" ? "" : text.trim();
 
@@ -674,8 +772,6 @@ export default async function handler(req, res) {
     return res.status(401).end();
   }
 
-  res.status(200).end(); // Acknowledge immediately — Telegram retries on timeout
-
   try {
     const update = req.body;
 
@@ -740,54 +836,82 @@ export default async function handler(req, res) {
       const msg = update.message;
       const userId = msg.from?.id;
       const chatId = msg.chat.id;
-      const text = (msg.text || "").trim();
+      const text = typeof msg.text === "string" ? msg.text.trim() : "";
+      const command = parseCommand(text);
+      const groupChat = isGroupChat(msg.chat);
 
-      // Must be in allowed user list
-      if (!isAllowedUser(userId)) {
-        await send(chatId, "⛔ You are not authorized to use this bot.");
+      const directCommand = isDirectCommandForThisBot(command);
+      if (command?.target && directCommand && !knownBotUsername()) {
+        ensureBotUsername().catch(() => {});
+      }
+
+      // Ignore GIFs, stickers, photos, and ordinary group chatter. This keeps the
+      // admin bot quiet in groups unless an admin explicitly sends a bot command.
+      if (!text || (groupChat && !directCommand)) {
         return;
       }
 
-      // /start or /login — begin auth flow
-      if (text === "/start" || text === "/login") {
-        if (await isAuthenticated(userId)) {
-          await send(chatId, "✅ You're already signed in.", mainMenu());
-        } else {
-          await send(chatId,
-            `🔐 <b>gh-notify Admin</b>\n\nYou're on the allow-list. Enter your dashboard password to continue.`
-          );
+      // Must be in allowed user list. In groups, stay quiet unless the user sent a
+      // direct command to avoid noisy replies to non-admin chat activity.
+      if (!isAllowedUser(userId)) {
+        if (!groupChat || directCommand) {
+          await send(chatId, "⛔ You are not authorized to use this bot.");
         }
         return;
       }
 
-      // /cancel — clear pending edit
-      if (text === "/cancel") {
-        await clearPending(userId);
+      if (directCommand && (command.name === "start" || command.name === "login")) {
+        const authenticated = await isAuthenticated(userId);
+        if (authenticated) {
+          await send(chatId, "✅ You're already signed in.", mainMenu());
+        } else if (command.args) {
+          await handleAuth(chatId, userId, command.args);
+        } else {
+          await send(chatId, authPromptText(groupChat));
+        }
+        return;
+      }
+
+      if (directCommand && command.name === "cancel") {
+        await clearPending(userId, chatId);
         await send(chatId, "❌ Cancelled.", mainMenu());
         return;
       }
 
-      // Not authenticated yet — treat any message as password attempt
-      if (!(await isAuthenticated(userId))) {
-        await handleAuth(chatId, userId, text);
-        return;
-      }
+      const authenticated = await isAuthenticated(userId);
 
-      // Authenticated — check for pending edit first
-      const handled = await handlePendingEdit(chatId, msg.message_id, userId, text);
-      if (handled) return;
-
-      // /menu — show main menu
-      if (text === "/menu" || text === "/help") {
+      if (directCommand && (command.name === "menu" || command.name === "help")) {
+        if (!authenticated) {
+          await send(chatId, authPromptText(groupChat));
+          return;
+        }
         await handleHome(chatId);
         return;
       }
 
-      // Anything else — show menu
-      await send(chatId, "Use the menu to navigate.", mainMenu());
+      // Not authenticated yet — only private messages are treated as password
+      // attempts, preventing random group messages from triggering auth replies.
+      if (!authenticated) {
+        if (!groupChat) await handleAuth(chatId, userId, text);
+        return;
+      }
+
+      // Authenticated — check for pending edit after command routing so /menu,
+      // /help, and /cancel can never be saved as config values.
+      const handled = await handlePendingEdit(chatId, msg.message_id, userId, text);
+      if (handled) return;
+
+      // Anything else — keep private chats helpful, but stay silent in groups.
+      if (!groupChat) {
+        await send(chatId, "Use the menu to navigate.", mainMenu());
+      }
     }
 
   } catch (err) {
     console.error("Bot handler error:", err);
+  } finally {
+    if (!res.headersSent) {
+      res.status(200).end();
+    }
   }
 }
