@@ -35,6 +35,10 @@ Optional workflow name filtering
 
 Thread/topic support for Telegram forums
 
+Redis-backed admin sessions, pending edits, cached bot identity, and instant runtime event toggles
+
+Group-safe Telegram admin bot command handling (ignores GIFs, stickers, and normal group chatter)
+
 Security alert notifications
 
 Pull request revert detection
@@ -167,6 +171,16 @@ Telegram bot
 GitHub repository
 
 Optional: Upstash Redis
+
+
+
+---
+
+Group Admin Bot Usage
+
+The Telegram admin webhook is safe to add to groups and supergroups. It only responds to explicit commands from allowed admin users, such as `/start`, `/login`, `/menu`, `/help`, and `/cancel` (including addressed forms like `/menu@YourBot`). Non-text messages such as GIFs, stickers, photos, and regular group chatter are ignored so the bot does not reply accidentally.
+
+Admin edit state is scoped by both user ID and chat ID, then stored in Redis when available, so editing config in one chat will not consume messages from another chat. Event toggle changes are written immediately to Redis runtime config and mirrored to Vercel env vars when Vercel credentials are configured.
 
 
 

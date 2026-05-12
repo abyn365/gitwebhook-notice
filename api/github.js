@@ -9,6 +9,8 @@ const EVENT_DEDUP_TTL_MS = 6 * 60 * 60 * 1000;
 const WORKFLOW_MESSAGE_TTL_MS = 24 * 60 * 60 * 1000;
 const EVENT_DEDUP_TTL_SECONDS = EVENT_DEDUP_TTL_MS / 1000;
 const WORKFLOW_MESSAGE_TTL_SECONDS = WORKFLOW_MESSAGE_TTL_MS / 1000;
+const RUNTIME_CONFIG_KEY = "admin:runtime_config";
+const REDIS_RUNTIME_READ_TIMEOUT_MS = 150;
 
 const processedEvents = new Map();
 const workflowMessageMap = new Map();
@@ -225,6 +227,23 @@ async function appendActivityLog(entry) {
   } catch (err) {
     console.error("Activity log write error:", err.message);
   }
+}
+
+
+async function getRuntimeConfig(key) {
+  const redis = await getRedisClient();
+  if (!redis) return null;
+
+  return Promise.race([
+    redis.hGet(RUNTIME_CONFIG_KEY, key),
+    new Promise((resolve) => setTimeout(() => resolve(null), REDIS_RUNTIME_READ_TIMEOUT_MS)),
+  ]).catch(() => null);
+}
+
+async function getDisabledEvents() {
+  const stored = await getRuntimeConfig("DISABLED_EVENTS");
+  const raw = stored ?? process.env.DISABLED_EVENTS ?? "";
+  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
 }
 
 function repoAllowed(fullName) {
@@ -775,6 +794,11 @@ export default async function handler(req, res) {
 
     if (!signature || signature !== digest) {
       return res.status(401).send("Invalid signature");
+    }
+
+    const disabledEvents = await getDisabledEvents();
+    if (disabledEvents.has(event)) {
+      return res.status(200).json({ ignored: true, reason: "event_disabled", event });
     }
 
     const repositoryName = req.body?.repository?.full_name;
