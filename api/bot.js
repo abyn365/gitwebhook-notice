@@ -119,6 +119,14 @@ async function ensureBotUsername() {
       return _botUsername;
     }
 
+    // Prefer Redis runtime config when the current deployment has not been
+    // restarted/redeployed with the mirrored Vercel env var yet.
+    const runtimeName = (await getRuntimeConfig("BOT_USERNAME"))?.trim().replace(/^@/, "");
+    if (runtimeName) {
+      _botUsername = runtimeName;
+      return _botUsername;
+    }
+
     // Try Redis cache before hitting the API
     const redis = await getRedis();
     const cached = await redis?.get("admin:bot_username").catch(() => null);
@@ -293,6 +301,16 @@ async function getRuntimeConfig(key) {
   return redis.hGet(RUNTIME_CONFIG_KEY, key).catch(() => null);
 }
 
+async function getRuntimeConfigValues(keys) {
+  const redis = await getRedis();
+  if (!redis) return {};
+
+  const values = await redis.hmGet(RUNTIME_CONFIG_KEY, keys).catch(() => null);
+  if (!Array.isArray(values)) return {};
+
+  return Object.fromEntries(keys.map((key, index) => [key, values[index] ?? null]));
+}
+
 function hasVercelConfig() {
   return !!(VERCEL_TOKEN() && VERCEL_PROJECT());
 }
@@ -304,6 +322,11 @@ function valueIsSet(value) {
 async function getEffectiveConfig(key) {
   const stored = await getRuntimeConfig(key);
   return stored ?? process.env[key] ?? "";
+}
+
+async function getEffectiveConfigValues(keys) {
+  const stored = await getRuntimeConfigValues(keys);
+  return Object.fromEntries(keys.map((key) => [key, stored[key] ?? process.env[key] ?? ""]));
 }
 
 async function mirrorConfigToVercel(key, value) {
@@ -475,23 +498,37 @@ function esc(s) {
 
 function dot(ok) { return ok ? "🟢" : "🔴"; }
 
-function configSummary() {
-  const chatRaw  = process.env.CHAT_ID || "";
+async function configSummary() {
+  const cfg = await getEffectiveConfigValues([
+    "BOT_TOKEN",
+    "BOT_USERNAME",
+    "CHAT_ID",
+    "WEBHOOK_SECRET",
+    "REDIS_URL",
+    "ALLOWED_REPOS",
+    "ALLOWED_BRANCH",
+    "WORKFLOW_NAME_FILTER",
+    "ONLY_FAILURES",
+    "SILENT_LOW_PRIORITY",
+    "DISABLED_EVENTS",
+  ]);
+  const botUsername = (cfg.BOT_USERNAME || "").trim().replace(/^@/, "");
+  const chatRaw  = cfg.CHAT_ID || "";
   const chats    = chatRaw.split(",").map(s => s.trim()).filter(Boolean);
-  const repos    = process.env.ALLOWED_REPOS || "—";
-  const branch   = process.env.ALLOWED_BRANCH || "—";
-  const wfFilter = process.env.WORKFLOW_NAME_FILTER || "—";
-  const onlyFail = process.env.ONLY_FAILURES === "true";
-  const silent   = process.env.SILENT_LOW_PRIORITY !== "false";
-  const disabled = (process.env.DISABLED_EVENTS || "").split(",").map(s => s.trim()).filter(Boolean);
-  const hasRedis = !!(process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL || process.env.webhook_REDIS_URL);
+  const repos    = cfg.ALLOWED_REPOS || "—";
+  const branch   = cfg.ALLOWED_BRANCH || "—";
+  const wfFilter = cfg.WORKFLOW_NAME_FILTER || "—";
+  const onlyFail = cfg.ONLY_FAILURES === "true";
+  const silent   = cfg.SILENT_LOW_PRIORITY !== "false";
+  const disabled = (cfg.DISABLED_EVENTS || "").split(",").map(s => s.trim()).filter(Boolean);
+  const hasRedis = !!(cfg.REDIS_URL || process.env.UPSTASH_REDIS_URL || process.env.webhook_REDIS_URL);
 
   return `<b>⚙️ Current Configuration</b>
 
-${dot(!!process.env.BOT_TOKEN)} <b>BOT_TOKEN</b>: ${process.env.BOT_TOKEN ? "configured" : "missing"}
-${dot(!!BOT_USERNAME())} <b>BOT_USERNAME</b>: ${BOT_USERNAME() ? `<code>${esc(BOT_USERNAME())}</code>` : "recommended for groups"}
+${dot(!!cfg.BOT_TOKEN)} <b>BOT_TOKEN</b>: ${cfg.BOT_TOKEN ? "configured" : "missing"}
+${dot(!!botUsername)} <b>BOT_USERNAME</b>: ${botUsername ? `<code>${esc(botUsername)}</code>` : "recommended for groups"}
 ${dot(chats.length > 0)} <b>CHAT_ID</b>: ${chats.length ? chats.map(c => `<code>${esc(c)}</code>`).join(", ") : "missing"}
-${dot(!!process.env.WEBHOOK_SECRET)} <b>WEBHOOK_SECRET</b>: ${process.env.WEBHOOK_SECRET ? "configured" : "missing"}
+${dot(!!cfg.WEBHOOK_SECRET)} <b>WEBHOOK_SECRET</b>: ${cfg.WEBHOOK_SECRET ? "configured" : "missing"}
 ${dot(hasRedis)} <b>Redis</b>: ${hasRedis ? "connected" : "in-memory fallback"}
 
 <b>Filters</b>
@@ -680,7 +717,7 @@ async function handleStatus(chatId, messageId) {
 }
 
 async function handleConfig(chatId, messageId) {
-  await edit(chatId, messageId, configSummary(), backMenu("home"));
+  await edit(chatId, messageId, await configSummary(), backMenu("home"));
 }
 
 async function handleActivity(chatId, messageId) {
