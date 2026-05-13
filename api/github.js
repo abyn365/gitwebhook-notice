@@ -53,16 +53,6 @@ function getWorkflowFilter(raw = process.env.WORKFLOW_NAME_FILTER || "") {
   return filter || null;
 }
 
-/**
- * Parse CHAT_ID env into an array of { chatId, threadId } objects.
- *
- * Supported formats (comma-separated):
- *   -100123456789          → private chat or plain group, no topic
- *   -100123456789:42       → forum supergroup, send into topic 42
- *
- * Private chats and plain groups must NOT include a threadId.
- * Forum supergroups with a configured topic MUST include one.
- */
 function parseChatTargets(raw) {
   return (raw || "")
     .split(",")
@@ -70,8 +60,6 @@ function parseChatTargets(raw) {
     .filter(Boolean)
     .map((entry) => {
       const colonIdx = entry.lastIndexOf(":");
-      // A colon at position 0 or 1 is part of a negative number — not a separator.
-      // A real separator colon will always be after the chat ID digits (position > 1).
       if (colonIdx > 1) {
         const chatId = entry.slice(0, colonIdx);
         const threadId = Number(entry.slice(colonIdx + 1));
@@ -182,25 +170,27 @@ async function isDuplicateEvent(eventKey) {
   return result !== "OK";
 }
 
-async function getWorkflowTracking(workflowRunId, chatId) {
-  const key = `github:workflow:${workflowRunId}:${chatId}`;
+// ── generic tracking (check_run, check_suite) ─────────────────────────────────
+
+async function getMessageTracking(trackingKey, chatId) {
+  const key = `github:msg:${trackingKey}:${chatId}`;
   const redis = await getRedisClient();
 
   if (!redis) {
     cleanupMap(workflowMessageMap, WORKFLOW_MESSAGE_TTL_MS);
-    return workflowMessageMap.get(`${workflowRunId}:${chatId}`) || null;
+    return workflowMessageMap.get(`${trackingKey}:${chatId}`) || null;
   }
 
   const raw = await redis.get(key);
   return raw ? JSON.parse(raw) : null;
 }
 
-async function saveWorkflowTracking(workflowRunId, chatId, trackingData) {
-  const key = `github:workflow:${workflowRunId}:${chatId}`;
+async function saveMessageTracking(trackingKey, chatId, trackingData, ttlSeconds = WORKFLOW_MESSAGE_TTL_SECONDS) {
+  const key = `github:msg:${trackingKey}:${chatId}`;
   const redis = await getRedisClient();
 
   if (!redis) {
-    workflowMessageMap.set(`${workflowRunId}:${chatId}`, {
+    workflowMessageMap.set(`${trackingKey}:${chatId}`, {
       ...trackingData,
       updatedAt: Date.now(),
     });
@@ -208,13 +198,19 @@ async function saveWorkflowTracking(workflowRunId, chatId, trackingData) {
   }
 
   await redis.set(key, JSON.stringify(trackingData), {
-    EX: WORKFLOW_MESSAGE_TTL_SECONDS,
+    EX: ttlSeconds,
   });
 }
 
+async function getWorkflowTracking(workflowRunId, chatId) {
+  return getMessageTracking(`workflow:${workflowRunId}`, chatId);
+}
+
+async function saveWorkflowTracking(workflowRunId, chatId, trackingData) {
+  return saveMessageTracking(`workflow:${workflowRunId}`, chatId, trackingData);
+}
+
 // ── activity log ─────────────────────────────────────────────────────────────
-// Writes a capped log entry to Redis so the admin bot can display recent events.
-// Silently no-ops when Redis is unavailable (no log stored in-memory by design).
 const ACTIVITY_LOG_KEY = "github:activity_log";
 const ACTIVITY_LOG_MAX = 50;
 
@@ -228,7 +224,6 @@ async function appendActivityLog(entry) {
     console.error("Activity log write error:", err.message);
   }
 }
-
 
 async function getRuntimeConfig(key) {
   const redis = await getRedisClient();
@@ -610,24 +605,34 @@ Name: ${rule.name || "-"}
 ${repository.html_url}`;
 }
 
-function buildCheckRunText(repository, checkRun, action) {
-  return `✅ Check Run ${action}
+function buildCheckRunText(repository, checkRun, status, conclusion) {
+  let emoji = "⏳";
+  if (status === "in_progress") emoji = "🛠️";
+  else if (status === "completed") emoji = conclusion === "success" ? "✅" : "❌";
+
+  const conclusionStr = conclusion ? ` / ${conclusion}` : "";
+
+  return `${emoji} Check Run
 
 Repo: ${repository.full_name}
 Name: ${checkRun.name}
-Status: ${checkRun.status || "-"}
-Conclusion: ${checkRun.conclusion || "-"}
+Status: ${status}${conclusionStr}
 
 ${checkRun.html_url || repository.html_url}`;
 }
 
-function buildCheckSuiteText(repository, checkSuite, action) {
-  return `🧪 Check Suite ${action}
+function buildCheckSuiteText(repository, checkSuite, status, conclusion) {
+  let emoji = "⏳";
+  if (status === "in_progress") emoji = "🛠️";
+  else if (status === "completed") emoji = conclusion === "success" ? "✅" : "❌";
+
+  const conclusionStr = conclusion ? ` / ${conclusion}` : "";
+
+  return `${emoji} Check Suite
 
 Repo: ${repository.full_name}
 Head branch: ${checkSuite.head_branch || "-"}
-Status: ${checkSuite.status || "-"}
-Conclusion: ${checkSuite.conclusion || "-"}
+Status: ${status}${conclusionStr}
 
 ${checkSuite.url || repository.html_url}`;
 }
@@ -694,8 +699,6 @@ function buildTelegramPayload(chatId, text, { silent = false, replyMarkup = null
     disable_notification: silent,
   };
 
-  // Only set message_thread_id for forum supergroups that have a topic configured.
-  // Private chats and plain groups must NOT receive this field.
   if (threadId) {
     payload.message_thread_id = threadId;
   }
@@ -782,6 +785,74 @@ async function upsertWorkflowNotification(botToken, chatTarget, workflowRun, mes
   });
 }
 
+/**
+ * Upsert a Telegram message for check_run or check_suite events.
+ * Tracks by (trackingKey, chatId). Edits the existing message when
+ * status/conclusion changes; sends a new one on first occurrence.
+ */
+async function upsertCheckNotification(botToken, chatTarget, trackingKey, message, currentStatus, currentConclusion, replyMarkup = null) {
+  const { chatId, threadId } = chatTarget;
+
+  const tracked = await getMessageTracking(trackingKey, chatId);
+
+  if (!tracked) {
+    const created = await telegramRequest(
+      botToken,
+      "sendMessage",
+      buildTelegramPayload(chatId, message, {
+        silent: false,
+        disableWebPagePreview: true,
+        threadId,
+        replyMarkup,
+      })
+    );
+
+    await saveMessageTracking(trackingKey, chatId, {
+      messageId: created.result?.message_id,
+      lastStatus: currentStatus,
+      lastConclusion: currentConclusion || null,
+    });
+
+    return;
+  }
+
+  const sameStatus = tracked.lastStatus === currentStatus;
+  const sameConclusion = tracked.lastConclusion === (currentConclusion || null);
+
+  if (sameStatus && sameConclusion) {
+    return;
+  }
+
+  if (tracked.messageId) {
+    const editPayload = {
+      chat_id: chatId,
+      message_id: tracked.messageId,
+      text: message,
+      disable_web_page_preview: true,
+    };
+    if (replyMarkup) editPayload.reply_markup = replyMarkup;
+    await telegramRequest(botToken, "editMessageText", editPayload);
+  } else {
+    const created = await telegramRequest(
+      botToken,
+      "sendMessage",
+      buildTelegramPayload(chatId, message, {
+        silent: false,
+        disableWebPagePreview: true,
+        threadId,
+        replyMarkup,
+      })
+    );
+    tracked.messageId = created.result?.message_id;
+  }
+
+  await saveMessageTracking(trackingKey, chatId, {
+    messageId: tracked.messageId,
+    lastStatus: currentStatus,
+    lastConclusion: currentConclusion || null,
+  });
+}
+
 export default async function handler(req, res) {
   try {
     const event = req.headers["x-github-event"];
@@ -839,7 +910,6 @@ export default async function handler(req, res) {
       return res.status(200).send("Duplicate webhook ignored");
     }
 
-    // Log this event for the admin bot's activity feed
     appendActivityLog({
       ts: Date.now(),
       event,
@@ -1247,15 +1317,17 @@ ${c.url || ""}
         return res.status(200).end();
       }
 
-      const text = buildCheckRunText(repository, checkRun, action);
+      const currentStatus = checkRun.status || "queued";
+      const currentConclusion = checkRun.conclusion || null;
+      const trackingKey = `check_run:${checkRun.id}`;
+      const text = buildCheckRunText(repository, checkRun, currentStatus, currentConclusion);
+      const replyMarkup = checkRun.html_url
+        ? { inline_keyboard: [[{ text: "Open Check", url: checkRun.html_url }]] }
+        : null;
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
-        silent: false,
-        disableWebPagePreview: false,
-        replyMarkup: checkRun.html_url
-          ? { inline_keyboard: [[{ text: "Open Check", url: checkRun.html_url }]] }
-          : undefined,
-      });
+      for (const chatTarget of CHAT_TARGETS) {
+        await upsertCheckNotification(BOT_TOKEN, chatTarget, trackingKey, text, currentStatus, currentConclusion, replyMarkup);
+      }
 
       return res.status(200).json({ ok: true });
     }
@@ -1273,15 +1345,17 @@ ${c.url || ""}
         return res.status(200).end();
       }
 
-      const text = buildCheckSuiteText(repository, checkSuite, action);
+      const currentStatus = checkSuite.status || "queued";
+      const currentConclusion = checkSuite.conclusion || null;
+      const trackingKey = `check_suite:${checkSuite.id}`;
+      const text = buildCheckSuiteText(repository, checkSuite, currentStatus, currentConclusion);
+      const replyMarkup = checkSuite.url
+        ? { inline_keyboard: [[{ text: "Open Check Suite", url: checkSuite.url }]] }
+        : null;
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
-        silent: false,
-        disableWebPagePreview: false,
-        replyMarkup: checkSuite.url
-          ? { inline_keyboard: [[{ text: "Open Check Suite", url: checkSuite.url }]] }
-          : undefined,
-      });
+      for (const chatTarget of CHAT_TARGETS) {
+        await upsertCheckNotification(BOT_TOKEN, chatTarget, trackingKey, text, currentStatus, currentConclusion, replyMarkup);
+      }
 
       return res.status(200).json({ ok: true });
     }
