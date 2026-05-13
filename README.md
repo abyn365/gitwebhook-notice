@@ -1,629 +1,218 @@
-GitHub → Telegram Webhook Notifier
+# GitHub → Telegram Webhook Notifier
 
-A production-ready GitHub webhook listener built for Vercel that sends rich, deduplicated notifications to Telegram with Redis-backed persistence and workflow state tracking.
+A small Vercel app that receives GitHub webhooks and sends useful Telegram notifications. It supports Redis-backed deduplication, GitHub Actions status updates, Telegram groups/topics, and an optional Telegram admin bot for runtime configuration.
 
-Supports push events, GitHub Actions, pull requests, issues, deployments, releases, security alerts, discussions, stars, forks, organization events, and more.
+## What it does
 
+- Sends GitHub events to one or more Telegram chats.
+- Deduplicates deliveries with Redis when configured.
+- Tracks GitHub Actions workflows and edits the same Telegram message as status changes.
+- Filters by repository, branch, workflow name, failure-only mode, and disabled event types.
+- Supports Telegram supergroups and forum topics through `CHAT_ID` entries.
+- Includes an admin bot at `/api/bot` for status, testing, and editing runtime config.
 
----
+## Project structure
 
-Features
+```text
+api/github.js  # GitHub webhook receiver
+api/bot.js     # Telegram admin dashboard bot
+```
 
-Real-time GitHub → Telegram notifications
+## Requirements
 
-Redis-backed deduplication (Upstash Redis supported)
+- Node.js 18+
+- Vercel project
+- Telegram bot token from [@BotFather](https://t.me/BotFather)
+- GitHub repository or organization webhook
+- Optional but recommended: Upstash Redis
 
-GitHub Actions workflow status tracking
+## Quick setup
 
-Edits existing workflow messages instead of spamming
+### 1. Install dependencies
 
-Multiple Telegram chats support
+```bash
+npm install
+```
 
-Silent low-priority notifications
+### 2. Create a Telegram bot
 
-Secure webhook signature validation
+1. Message [@BotFather](https://t.me/BotFather).
+2. Create a bot.
+3. Copy the bot token into `BOT_TOKEN`.
+4. For group usage, also copy the bot username into `BOT_USERNAME` without `@`.
 
-Supports repository and organization webhooks
+### 3. Find your chat ID
 
-Optimized for Vercel serverless runtime
+Add the bot to the target private chat, group, or channel, send a message, then open:
 
-Branch filtering
+```text
+https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
+```
 
-Repository filtering
+Use the returned `chat.id` as `CHAT_ID`.
 
-Optional workflow name filtering
+Examples:
 
-Thread/topic support for Telegram forums
+```env
+CHAT_ID=123456789
+CHAT_ID=123456789,-100987654321
+```
 
-Redis-backed admin sessions, pending edits, cached bot identity, and instant runtime event toggles
+For Telegram forum topics, append the topic/thread ID after the chat ID:
 
-Group-safe Telegram admin bot command handling (ignores GIFs, stickers, and normal group chatter)
+```env
+CHAT_ID=-100987654321:1234
+```
 
-Security alert notifications
+### 4. Configure environment variables
 
-Pull request revert detection
+Set these in Vercel project settings.
 
-Deployment status monitoring
+```env
+BOT_TOKEN=123456:ABCDEF
+BOT_USERNAME=yourBotName
+CHAT_ID=-100987654321
+WEBHOOK_SECRET=change_me
 
-PR review and discussion notifications
+# Recommended
+REDIS_URL=rediss://default:password@host:port
 
+# Optional filters
+ALLOWED_REPOS=owner/repo1,owner/repo2
+ALLOWED_BRANCH=main
+WORKFLOW_NAME_FILTER=deploy
+ONLY_FAILURES=false
+SILENT_LOW_PRIORITY=true
+DISABLED_EVENTS=
 
+# Optional Telegram admin bot
+ADMIN_USER_IDS=123456789
+DASHBOARD_PASSWORD=change_me_too
 
----
+# Optional: lets the admin bot mirror runtime edits back to Vercel env vars
+VERCEL_TOKEN=
+VERCEL_PROJECT_ID=
+VERCEL_TEAM_ID=
+```
 
-Supported GitHub Events
+## Environment variables
 
-Repository Activity
-
-Pushes
-
-Branch/tag creation
-
-Branch/tag deletion
-
-Stars
-
-Forks
-
-Repository updates
-
-Branch protection changes
-
-
-Pull Requests
-
-Opened
-
-Merged
-
-Closed
-
-Reopened
-
-Draft conversion
-
-Review requests
-
-Synchronization updates
-
-Revert PR detection
-
-
-GitHub Actions / CI
-
-Workflow runs
-
-Check runs
-
-Check suites
-
-Deployment statuses
-
-
-Issues & Discussions
-
-Issues
-
-Issue comments
-
-Discussions
-
-Discussion comments
-
-PR review comments
-
-PR reviews
-
-
-Releases & Deployments
-
-Releases
-
-Deployments
-
-Deployment statuses
-
-
-Security
-
-Dependabot alerts
-
-Secret scanning alerts
-
-Code scanning alerts
-
-
-Organization Events
-
-Organization members
-
-Teams
-
-Membership changes
-
-
-
----
-
-Architecture
-
-GitHub Webhook
-       ↓
-Vercel Serverless Function
-       ↓
-Redis Deduplication Layer
-       ↓
-Telegram Bot API
-       ↓
-Telegram Chats / Groups / Topics
-
-
----
-
-Requirements
-
-Node.js 18+
-
-Vercel account
-
-Telegram bot
-
-GitHub repository
-
-Optional: Upstash Redis
-
-
-
----
-
-Group Admin Bot Usage
-
-The Telegram admin webhook is safe to add to groups and supergroups. It only responds to explicit commands from allowed admin users, such as `/start`, `/login`, `/menu`, `/help`, and `/cancel` (including addressed forms like `/menu@YourBot`). Non-text messages such as GIFs, stickers, photos, and regular group chatter are ignored so the bot does not reply accidentally.
-
-For the most reliable group routing, set `BOT_USERNAME` to your bot username without `@` (for example, `abyngithubBot`). In a group, authenticate with `/start <dashboard-password>` or `/login <dashboard-password>`; plain password messages are intentionally ignored in groups. Configure the Telegram webhook with `secret_token` and `allowed_updates` for a direct secure webhook connection:
+| Variable | Required | Description |
+| --- | --- | --- |
+| `BOT_TOKEN` | Yes | Telegram bot token. |
+| `CHAT_ID` | Yes | One or more chat IDs, comma-separated. Use `chatId:threadId` for forum topics. |
+| `WEBHOOK_SECRET` | Yes | Shared secret used by GitHub webhook signature validation and Telegram admin webhook secret token. |
+| `BOT_USERNAME` | Recommended | Bot username without `@`; improves group command routing. |
+| `REDIS_URL` | Recommended | Redis connection string. `UPSTASH_REDIS_URL` and `webhook_REDIS_URL` are also supported. |
+| `ALLOWED_REPOS` | No | Comma-separated `owner/repo` allow-list. Empty means all repos. |
+| `ALLOWED_BRANCH` | No | Only notify for one branch, for example `main`. |
+| `WORKFLOW_NAME_FILTER` | No | Only notify workflows whose names include this text. |
+| `ONLY_FAILURES` | No | Set to `true` to suppress successful/non-failure notifications. |
+| `SILENT_LOW_PRIORITY` | No | Defaults to silent notifications for low-priority events unless set to `false`. |
+| `DISABLED_EVENTS` | No | Comma-separated GitHub event names to ignore. |
+| `ADMIN_USER_IDS` | Admin bot | Comma-separated Telegram user IDs allowed to use `/api/bot`. |
+| `DASHBOARD_PASSWORD` | Admin bot | Password required after the user ID allow-list check. |
+| `VERCEL_TOKEN` | Optional | Vercel token used to mirror admin edits to Vercel env vars. |
+| `VERCEL_PROJECT_ID` | Optional | Vercel project ID for env var mirroring. |
+| `VERCEL_TEAM_ID` | Optional | Vercel team ID, if the project belongs to a team. |
+
+## Deploy to Vercel
+
+1. Import this repository in Vercel.
+2. Add the environment variables above.
+3. Deploy the project.
+4. Your GitHub webhook URL will be:
+
+```text
+https://<your-vercel-domain>/api/github
+```
+
+## GitHub webhook setup
+
+In your repository or organization settings, create a webhook:
+
+| Setting | Value |
+| --- | --- |
+| Payload URL | `https://<your-vercel-domain>/api/github` |
+| Content type | `application/json` |
+| Secret | Same value as `WEBHOOK_SECRET` |
+| SSL verification | Enabled |
+| Events | Send everything, or select only the events you want |
+
+## Telegram admin bot
+
+The admin bot lives at:
+
+```text
+https://<your-vercel-domain>/api/bot
+```
+
+Set its Telegram webhook:
 
 ```bash
 curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://<host>/api/bot","secret_token":"<WEBHOOK_SECRET>","allowed_updates":["message","callback_query"]}'
+  -d '{"url":"https://<your-vercel-domain>/api/bot","secret_token":"<WEBHOOK_SECRET>","allowed_updates":["message","callback_query"]}'
 ```
 
-Admin edit state is scoped by both user ID and chat ID, then stored in Redis when available, so editing config in one chat will not consume messages from another chat. Event toggle changes are written immediately to Redis runtime config and mirrored to Vercel env vars when Vercel credentials are configured.
+Admin commands:
 
+- `/start` or `/login` — authenticate.
+- `/menu` or `/help` — open the dashboard.
+- `/cancel` — cancel a pending edit.
 
+In groups, use `/start <dashboard-password>` or `/login <dashboard-password>`. Plain password messages are ignored in groups so the bot does not react to normal chat messages.
 
----
+### Runtime config behavior
 
-Installation
+Admin edits are saved to Redis runtime config first. If Vercel credentials are configured, the bot also mirrors the value to Vercel env vars.
 
-1. Clone Repository
+Important: Vercel env vars are deployment-time values. If a value is mirrored to Vercel, the current deployment may still use the Redis runtime value until the project is redeployed or restarted.
 
-git clone https://github.com/yourusername/github-telegram-webhook.git
-cd github-telegram-webhook
+## Supported events
 
+Common supported events include:
 
----
+- Pushes, branch/tag creates, branch/tag deletes
+- Pull requests, reviews, review comments
+- GitHub Actions workflow runs, check runs, check suites
+- Issues and issue comments
+- Discussions and discussion comments
+- Releases and deployment statuses
+- Stars, forks, repository events
+- Dependabot, secret scanning, and code scanning alerts
+- Organization member/team/membership events
 
-2. Install Dependencies
+## Troubleshooting
 
-npm install redis
+### `BOT_USERNAME` says recommended even though Vercel has it
 
+Use the latest version of this repo. The dashboard should read the effective runtime value from Redis first, then fall back to `process.env`.
 
----
+If it still looks wrong:
 
-3. Create Telegram Bot
+1. Check that Redis is connected in the admin dashboard.
+2. Open the edit screen for `BOT_USERNAME` and confirm the current value.
+3. Redeploy Vercel if you need the deployment-time `process.env.BOT_USERNAME` to update.
 
-Open Telegram and message:
-
-@BotFather
-
-Create a new bot and obtain:
-
-BOT_TOKEN
-
-
----
-
-4. Get Telegram Chat ID
-
-Add your bot to a group/channel/private chat.
-
-Then open:
-
-https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
-
-Find:
-
-"chat": {
-  "id": 123456789
-}
-
-Use that as:
-
-CHAT_ID=123456789
-
-Multiple chats supported:
-
-CHAT_ID=123456789,-100987654321
-
-
----
-
-Redis Setup (Recommended)
-
-Upstash Redis
-
-Create a database at:
-
-Upstash Redis
-
-Copy the Redis connection string:
-
-REDIS_URL=rediss://default:password@host:port
-
-
----
-
-Environment Variables
-
-Create:
-
-.env.local
-
-Example:
-
-BOT_TOKEN=123456:ABCDEF
-CHAT_ID=123456789,-100987654321
-WEBHOOK_SECRET=my_super_secret
-
-REDIS_URL=rediss://default:password@host:port
-
-ALLOWED_BRANCH=main
-WORKFLOW_NAME_FILTER=deploy
-ALLOWED_REPOS=owner/repo1,owner/repo2
-
-ONLY_FAILURES=false
-SILENT_LOW_PRIORITY=true
-
-TELEGRAM_THREAD_ID=1234
-
-
----
-
-Variable Reference
-
-Variable	Required	Description
-
-BOT_TOKEN	Yes	Telegram bot token
-CHAT_ID	Yes	One or multiple Telegram chat IDs
-WEBHOOK_SECRET	Yes	GitHub webhook secret
-REDIS_URL	No	Upstash Redis URL
-ALLOWED_BRANCH	No	Only process a specific branch
-WORKFLOW_NAME_FILTER	No	Filter workflow names
-ALLOWED_REPOS	No	Comma-separated allowed repositories
-ONLY_FAILURES	No	Only notify failures
-SILENT_LOW_PRIORITY	No	Silence stars/forks
-TELEGRAM_THREAD_ID	No	Telegram topic/thread ID
-
-
-
----
-
-Deploy to Vercel
-
-1. Import Project
-
-Go to:
-
-Vercel Dashboard
-
-Import your GitHub repository.
-
-
----
-
-2. Add Environment Variables
-
-In:
-
-Project Settings → Environment Variables
-
-Add all variables from .env.local.
-
-
----
-
-3. Deploy
-
-vercel --prod
-
-
----
-
-GitHub Webhook Setup
-
-Open:
-
-Repository → Settings → Webhooks
-
-Add webhook:
-
-Setting	Value
-
-Payload URL	https://yourdomain.vercel.app/api/github
-Content Type	application/json
-Secret	Same as WEBHOOK_SECRET
-SSL Verification	Enable
-Events	Send me everything
-
-
-
----
-
-Organization Webhook Setup
-
-For organization-level events:
-
-Organization → Settings → Webhooks
-
-Use the same URL and secret.
-
-
----
-
-Telegram Topics / Forum Support
-
-If using Telegram forum groups:
-
-1. Create a topic
-
-
-2. Send a message inside topic
-
-
-3. Use:
-
-
-
-getUpdates
-
-Find:
-
-"message_thread_id": 1234
-
-Set:
-
-TELEGRAM_THREAD_ID=1234
-
-
----
-
-Security
-
-Webhook Signature Validation
-
-Every request is validated using:
-
-X-Hub-Signature-256
-
-with HMAC SHA256 verification.
-
-
----
-
-Deduplication
-
-Uses Redis NX writes to prevent duplicate processing:
-
-github:dedup:<event>
-
-
----
-
-Workflow State Tracking
-
-Workflow messages are edited instead of creating spam:
-
-Queued → Building → Success/Failure
-
-
----
-
-Example Notifications
-
-Push
-
-🚀 Git Push
-
-Repo: owner/repo
-Branch: main
-
-• user: Fix API bug
-• user: Add Redis support
-
-
----
-
-Pull Request
-
-✅ Pull Request merged
-
-Repo: owner/repo
-Title: Add webhook support
-
-
----
-
-Deployment
-
-🚀 Deployment success
-
-Environment: production
-
-
----
-
-Security Alert
-
-🚨 Dependabot Alert
-
-Severity: high
-Package: axios
-
-
----
-
-Production Recommendations
-
-Recommended
-
-Use Redis
-
-Enable webhook secret
-
-Use repository filtering
-
-Use branch filtering
-
-Use silent notifications for stars/forks
-
-Use Telegram topics for organization
-
-
-Optional
-
-Enable ONLY_FAILURES in noisy repositories
-
-Separate production/staging chats
-
-Add rate limiting
-
-Add log aggregation
-
-
-
----
-
-Scaling Notes
-
-This project is optimized for:
-
-Vercel serverless
-
-Multiple repositories
-
-Organization-wide monitoring
-
-High event volume
-
-Persistent workflow tracking
-
-
-Redis significantly improves reliability under concurrent webhook bursts.
-
-
----
-
-Troubleshooting
-
-No Telegram Messages
+### No Telegram messages
 
 Check:
 
-Bot added to group
+- `BOT_TOKEN` is correct.
+- The bot is in the chat and can send messages.
+- `CHAT_ID` matches the target chat or topic.
+- `WEBHOOK_SECRET` matches the GitHub webhook secret.
+- Vercel function logs for Telegram API errors.
 
-Bot has permission to send messages
+### Invalid GitHub signature
 
-Correct CHAT_ID
+Make sure the GitHub webhook secret exactly matches `WEBHOOK_SECRET`.
 
-Correct BOT_TOKEN
+### Duplicate or missing workflow updates
 
+Use Redis. Without Redis, deduplication and workflow tracking fall back to process memory and are less reliable in serverless environments.
 
+## License
 
----
-
-Webhook Timeout
-
-Usually caused by:
-
-Redis connection issues
-
-Telegram API timeout
-
-Infinite retries
-
-
-Ensure:
-
-REDIS_URL
-
-is valid.
-
-
----
-
-Invalid Signature
-
-Ensure:
-
-WEBHOOK_SECRET
-
-matches GitHub webhook secret exactly.
-
-
----
-
-License
-
-MIT License
-
-
----
-
-Suggested Future Improvements
-
-Slack/Discord support
-
-Message templates
-
-Database event history
-
-GitHub App integration
-
-Rate limiting
-
-Admin dashboard
-
-Analytics
-
-Event routing rules
-
-Per-chat subscriptions
-
-Retry queues
-
-Web UI
-
-
-
----
-
-Tech Stack
-
-Node.js
-
-Vercel Serverless Functions
-
-Redis / Upstash
-
-Telegram Bot API
-
-GitHub Webhooks
-
-
-
----
-
-Credits
-
-Built for production-grade GitHub repository monitoring with Telegram notifications.
+MIT
