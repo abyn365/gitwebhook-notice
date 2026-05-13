@@ -306,26 +306,47 @@ async function getEffectiveConfig(key) {
   return stored ?? process.env[key] ?? "";
 }
 
-async function saveConfigValue(key, value) {
+async function mirrorConfigToVercel(key, value) {
+  if (value === "") {
+    await vercelDeleteEnv(key);
+  } else {
+    await vercelUpsertEnv(key, value);
+  }
+}
+
+function queueVercelMirror(key, value, chatId = null) {
+  if (!hasVercelConfig()) return false;
+
+  const task = mirrorConfigToVercel(key, value).catch(err => {
+    console.error(`Vercel mirror failed for ${key}:`, err?.message || err);
+    if (chatId) {
+      return send(chatId, `⚠️ Vercel mirror failed for <b>${esc(key)}</b>: ${esc(err?.message || err)}`).catch(() => {});
+    }
+    return null;
+  });
+  if (typeof globalThis.waitUntil === "function") globalThis.waitUntil(task);
+  return true;
+}
+
+async function saveConfigValue(key, value, { awaitMirror = false, mirrorErrorChatId = null } = {}) {
   const savedToRedis = await setRuntimeConfig(key, value);
   process.env[key] = value;
 
-  let mirroredToVercel = false;
-  let vercelError = null;
-  if (hasVercelConfig()) {
-    try {
-      if (value === "") {
-        await vercelDeleteEnv(key);
-      } else {
-        await vercelUpsertEnv(key, value);
-      }
-      mirroredToVercel = true;
-    } catch (err) {
-      vercelError = err;
-    }
+  if (!hasVercelConfig()) {
+    return { savedToRedis, mirroredToVercel: false, mirrorQueued: false, vercelError: null };
   }
 
-  return { savedToRedis, mirroredToVercel, vercelError };
+  if (!awaitMirror) {
+    const mirrorQueued = queueVercelMirror(key, value, mirrorErrorChatId);
+    return { savedToRedis, mirroredToVercel: false, mirrorQueued, vercelError: null };
+  }
+
+  try {
+    await mirrorConfigToVercel(key, value);
+    return { savedToRedis, mirroredToVercel: true, mirrorQueued: false, vercelError: null };
+  } catch (err) {
+    return { savedToRedis, mirroredToVercel: false, mirrorQueued: false, vercelError: err };
+  }
 }
 
 async function getRedisStats() {
@@ -674,7 +695,6 @@ async function handleEvents(chatId, messageId) {
 }
 
 async function handleToggleEvent(chatId, messageId, callbackId, eventName) {
-  const hasVercel = hasVercelConfig();
   const disabled  = await getDisabledEvents();
 
   if (disabled.has(eventName)) {
@@ -683,23 +703,13 @@ async function handleToggleEvent(chatId, messageId, callbackId, eventName) {
     disabled.add(eventName);
   }
 
-  const newValue     = [...disabled].join(",");
-  const savedToRedis = await setRuntimeConfig("DISABLED_EVENTS", newValue);
-  process.env.DISABLED_EVENTS = newValue;
+  const newValue = [...disabled].join(",");
+  const result = await saveConfigValue("DISABLED_EVENTS", newValue, { mirrorErrorChatId: chatId });
 
-  if (hasVercel) {
-    try {
-      if (newValue) {
-        await vercelUpsertEnv("DISABLED_EVENTS", newValue);
-      } else {
-        await vercelDeleteEnv("DISABLED_EVENTS");
-      }
-      await answerCallback(callbackId, disabled.has(eventName) ? `🔴 ${eventName} disabled` : `🟢 ${eventName} enabled`);
-    } catch (err) {
-      await answerCallback(callbackId, `Saved in Redis; Vercel error: ${err.message}`);
-    }
+  if (result.savedToRedis) {
+    await answerCallback(callbackId, disabled.has(eventName) ? `🔴 ${eventName} disabled` : `🟢 ${eventName} enabled`);
   } else {
-    await answerCallback(callbackId, savedToRedis ? "Saved in Redis runtime config" : "⚠️ Temporary — Redis not configured");
+    await answerCallback(callbackId, `⚠️ Temporary — Redis not configured`);
   }
 
   await handleEvents(chatId, messageId);
@@ -750,12 +760,12 @@ async function handleToggle(chatId, messageId, callbackId, key) {
   const currentValue = await getEffectiveConfig(key);
   const current = currentValue === "true";
   const newVal  = current ? "false" : "true";
-  const result = await saveConfigValue(key, newVal);
+  const result = await saveConfigValue(key, newVal, { mirrorErrorChatId: chatId });
 
   if (result.vercelError) {
     await answerCallback(callbackId, `Saved in Redis; Vercel error: ${result.vercelError.message}`);
   } else if (result.savedToRedis) {
-    await answerCallback(callbackId, `${key} → ${newVal}`);
+    await answerCallback(callbackId, result.mirrorQueued ? `${key} → ${newVal}; Vercel mirror queued` : `${key} → ${newVal}`);
   } else {
     await answerCallback(callbackId, `⚠️ Temporary — Redis not configured`);
   }
@@ -794,13 +804,15 @@ Send <code>-</code> again to confirm, or send /cancel to abort.`,
 
   await send(chatId, `💾 Saving <b>${esc(key)}</b>…`);
 
-  const result = await saveConfigValue(key, newValue);
+  const result = await saveConfigValue(key, newValue, { mirrorErrorChatId: chatId });
   const display = SENSITIVE.has(key) && newValue ? "••••••••" : `<code>${esc(newValue || "(cleared)")}</code>`;
   let suffix = "";
   if (result.vercelError) {
     suffix = `\n⚠️ Saved to Redis runtime config, but Vercel mirror failed: ${esc(result.vercelError.message)}`;
   } else if (result.mirroredToVercel) {
     suffix = "\n🔁 Mirrored to Vercel.";
+  } else if (result.mirrorQueued) {
+    suffix = "\n🔁 Vercel mirror queued.";
   } else if (result.savedToRedis) {
     suffix = "\n💾 Saved to Redis runtime config.";
   } else {
@@ -948,9 +960,8 @@ export default async function handler(req, res) {
 
       const directCommand = isDirectCommandForThisBot(command);
 
-      // Ignore GIFs, stickers, photos, and ordinary group chatter.
-      // In groups, only react when a direct bot command is addressed to us.
-      if (!text || (groupChat && !directCommand)) {
+      // Ignore GIFs, stickers, photos, and empty messages.
+      if (!text) {
         return res.status(200).end();
       }
 
@@ -958,6 +969,16 @@ export default async function handler(req, res) {
       if (!isAllowedUser(userId)) {
         if (!groupChat || directCommand) {
           await send(chatId, "⛔ You are not authorized to use this bot.");
+        }
+        return res.status(200).end();
+      }
+
+      // In groups, ordinary text is normally ignored, but a pending config edit
+      // is allowed to consume the user's next message as the new value.
+      if (groupChat && !directCommand) {
+        if (await isAuthenticated(userId)) {
+          const handled = await handlePendingEdit(chatId, msg.message_id, userId, text);
+          if (handled) return res.status(200).end();
         }
         return res.status(200).end();
       }
