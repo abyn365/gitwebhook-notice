@@ -279,18 +279,60 @@ async function clearPending(userId, chatId) {
 async function setRuntimeConfig(key, value) {
   const redis = await getRedis();
   if (!redis) return false;
-  if (value === "") {
-    await redis.hDel(RUNTIME_CONFIG_KEY, key).catch(() => {});
-  } else {
-    await redis.hSet(RUNTIME_CONFIG_KEY, key, value).catch(() => {});
+  try {
+    await redis.hSet(RUNTIME_CONFIG_KEY, key, value);
+    return true;
+  } catch {
+    return false;
   }
-  return true;
 }
 
 async function getRuntimeConfig(key) {
   const redis = await getRedis();
   if (!redis) return null;
   return redis.hGet(RUNTIME_CONFIG_KEY, key).catch(() => null);
+}
+
+function hasVercelConfig() {
+  return !!(VERCEL_TOKEN() && VERCEL_PROJECT());
+}
+
+function valueIsSet(value) {
+  return value !== undefined && value !== null && value !== "";
+}
+
+async function getEffectiveConfig(key) {
+  const stored = await getRuntimeConfig(key);
+  return stored ?? process.env[key] ?? "";
+}
+
+async function saveConfigValue(key, value) {
+  const savedToRedis = await setRuntimeConfig(key, value);
+  process.env[key] = value;
+
+  let mirroredToVercel = false;
+  let vercelError = null;
+  if (hasVercelConfig()) {
+    try {
+      if (value === "") {
+        await vercelDeleteEnv(key);
+      } else {
+        await vercelUpsertEnv(key, value);
+      }
+      mirroredToVercel = true;
+    } catch (err) {
+      vercelError = err;
+    }
+  }
+
+  return { savedToRedis, mirroredToVercel, vercelError };
+}
+
+async function getRedisStats() {
+  const redis = await getRedis();
+  if (!redis) return { configured: false, keyCount: null };
+  const keyCount = await redis.dbSize().catch(() => null);
+  return { configured: true, keyCount };
 }
 
 async function getDisabledEvents() {
@@ -421,7 +463,7 @@ function configSummary() {
   const onlyFail = process.env.ONLY_FAILURES === "true";
   const silent   = process.env.SILENT_LOW_PRIORITY !== "false";
   const disabled = (process.env.DISABLED_EVENTS || "").split(",").map(s => s.trim()).filter(Boolean);
-  const hasRedis = !!(process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL);
+  const hasRedis = !!(process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL || process.env.webhook_REDIS_URL);
 
   return `<b>⚙️ Current Configuration</b>
 
@@ -442,13 +484,13 @@ ${dot(hasRedis)} <b>Redis</b>: ${hasRedis ? "connected" : "in-memory fallback"}
 • Disabled events: ${disabled.length ? disabled.map(e => `<code>${esc(e)}</code>`).join(", ") : "none"}`;
 }
 
-function statusSummary(botInfo, webhookInfo) {
+function statusSummary(botInfo, webhookInfo, stats = {}) {
   const env = {
     hasBot:    !!process.env.BOT_TOKEN,
     hasChatId: !!(process.env.CHAT_ID || "").trim(),
     hasSecret: !!process.env.WEBHOOK_SECRET,
-    hasRedis:  !!(process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL),
-    hasVercel: !!(VERCEL_TOKEN() && VERCEL_PROJECT()),
+    hasRedis:  !!(process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL || process.env.webhook_REDIS_URL),
+    hasVercel: hasVercelConfig(),
   };
 
   let out = `<b>📊 Status</b>\n\n`;
@@ -464,7 +506,18 @@ function statusSummary(botInfo, webhookInfo) {
   out += `${dot(env.hasChatId)} CHAT_ID\n`;
   out += `${dot(env.hasSecret)} WEBHOOK_SECRET\n`;
   out += `${dot(env.hasRedis)}  Redis\n`;
-  out += `${dot(env.hasVercel)} Vercel API (config editing)\n`;
+  out += `${dot(env.hasVercel)} Vercel API (optional config mirror)\n`;
+
+  const uptimeSeconds = Math.floor(process.uptime());
+  const uptime = uptimeSeconds < 3600
+    ? `${Math.floor(uptimeSeconds / 60)}m ${uptimeSeconds % 60}s`
+    : `${Math.floor(uptimeSeconds / 3600)}h ${Math.floor((uptimeSeconds % 3600) / 60)}m`;
+  const redisKeys = stats.redis?.keyCount === null || stats.redis?.keyCount === undefined
+    ? (stats.redis?.configured ? "unavailable" : "Redis unavailable")
+    : String(stats.redis.keyCount);
+  out += `\n<b>📊 Stats</b>\n`;
+  out += `Redis keys: <code>${esc(redisKeys)}</code>\n`;
+  out += `Uptime: <code>${esc(uptime)}</code>\n`;
 
   if (webhookInfo?.url) {
     const pending = webhookInfo.pending_update_count ?? 0;
@@ -519,9 +572,6 @@ function backMenu(target = "home") {
 }
 
 function editMenu() {
-  const hasVercel = !!(VERCEL_TOKEN() && VERCEL_PROJECT());
-  if (!hasVercel) return null;
-
   const rows = [];
   const keys = EDITABLE_KEYS.filter(k => !["ONLY_FAILURES", "SILENT_LOW_PRIORITY", "DISABLED_EVENTS"].includes(k));
   for (let i = 0; i < keys.length; i += 2) {
@@ -601,7 +651,11 @@ async function handleStatus(chatId, messageId) {
     if (d.ok) webhookInfo = d.result;
   } catch {}
 
-  await edit(chatId, messageId, statusSummary(botInfo, webhookInfo), backMenu("home"));
+  const stats = { redis: await getRedisStats() };
+  await edit(chatId, messageId, statusSummary(botInfo, webhookInfo, stats), kb([
+    [{ text: "🔄 Reload", callback_data: "status" }],
+    [{ text: "← Back", callback_data: "home" }],
+  ]));
 }
 
 async function handleConfig(chatId, messageId) {
@@ -620,7 +674,7 @@ async function handleEvents(chatId, messageId) {
 }
 
 async function handleToggleEvent(chatId, messageId, callbackId, eventName) {
-  const hasVercel = !!(VERCEL_TOKEN() && VERCEL_PROJECT());
+  const hasVercel = hasVercelConfig();
   const disabled  = await getDisabledEvents();
 
   if (disabled.has(eventName)) {
@@ -652,18 +706,16 @@ async function handleToggleEvent(chatId, messageId, callbackId, eventName) {
 }
 
 async function handleEditMenu(chatId, messageId) {
-  const hasVercel = !!(VERCEL_TOKEN() && VERCEL_PROJECT());
-  if (!hasVercel) {
-    await edit(
-      chatId, messageId,
-      "⚠️ <b>Config editing requires Vercel API.</b>\n\nSet <code>VERCEL_TOKEN</code> and <code>VERCEL_PROJECT_ID</code> in your environment variables.",
-      backMenu("home")
-    );
-    return;
-  }
+  const mirrorText = hasVercelConfig()
+    ? "Changes are saved to Redis runtime config and mirrored to Vercel."
+    : "⚠️ <b>Redis-only mode:</b> Vercel is not configured, so changes are saved only to Redis runtime config (or process memory if Redis is unavailable).";
   await edit(
     chatId, messageId,
-    "✏️ <b>Edit Config</b>\n\nSelect a variable to update. Sensitive values (token, secret) are write-only.",
+    `✏️ <b>Edit Config</b>
+
+${mirrorText}
+
+Select a variable to update. Sensitive values (token, secret) are write-only.`,
     editMenu()
   );
 }
@@ -671,34 +723,41 @@ async function handleEditMenu(chatId, messageId) {
 async function handleEditKey(chatId, messageId, userId, key) {
   await setPending(userId, chatId, { key, promptMessageId: messageId });
   const isSensitive = SENSITIVE.has(key);
+  const effective = await getEffectiveConfig(key);
   const current = isSensitive
-    ? "(hidden)"
-    : (process.env[key] ? `<code>${esc(process.env[key])}</code>` : "(not set)");
+    ? (valueIsSet(effective) ? "(hidden)" : "(not set)")
+    : (valueIsSet(effective) ? `<code>${esc(effective)}</code>` : "(not set)");
+  const saveMode = hasVercelConfig()
+    ? "Saved first to Redis runtime config, then mirrored to Vercel."
+    : "⚠️ Redis-only mode: Vercel is not configured, so this will not update Vercel environment variables.";
 
   await edit(
     chatId, messageId,
-    `✏️ <b>Editing: ${esc(key)}</b>\n\nCurrent value: ${current}\n\nSend the new value as a message, or send <code>-</code> to clear it.\n\nSend /cancel to abort.`,
+    `✏️ <b>Editing: ${esc(key)}</b>
+
+Current value: ${current}
+
+<i>${saveMode}</i>
+
+Send the new value as a message, or send <code>-</code> to clear it. You will be asked to confirm clearing.
+
+Send /cancel to abort.`,
     kb([[{ text: "Cancel", callback_data: "edit" }]])
   );
 }
 
 async function handleToggle(chatId, messageId, callbackId, key) {
-  const current = process.env[key] === "true";
+  const currentValue = await getEffectiveConfig(key);
+  const current = currentValue === "true";
   const newVal  = current ? "false" : "true";
+  const result = await saveConfigValue(key, newVal);
 
-  const hasVercel = !!(VERCEL_TOKEN() && VERCEL_PROJECT());
-  if (hasVercel) {
-    try {
-      await vercelUpsertEnv(key, newVal);
-      process.env[key] = newVal;
-      await answerCallback(callbackId, `${key} → ${newVal}`);
-    } catch (err) {
-      await answerCallback(callbackId, `Error: ${err.message}`);
-      return;
-    }
+  if (result.vercelError) {
+    await answerCallback(callbackId, `Saved in Redis; Vercel error: ${result.vercelError.message}`);
+  } else if (result.savedToRedis) {
+    await answerCallback(callbackId, `${key} → ${newVal}`);
   } else {
-    process.env[key] = newVal;
-    await answerCallback(callbackId, `⚠️ Temporary — no Vercel API`);
+    await answerCallback(callbackId, `⚠️ Temporary — Redis not configured`);
   }
 
   await handleEditMenu(chatId, messageId);
@@ -708,36 +767,52 @@ async function handlePendingEdit(chatId, messageId, userId, text) {
   const pending = await getPending(userId, chatId);
   if (!pending) return false; // not in edit mode
 
-  if (text === "/cancel") {
+  const command = parseCommand(text);
+  if ((command?.name === "cancel" && isDirectCommandForThisBot(command)) || text.toLowerCase() === "cancel") {
     await clearPending(userId, chatId);
     await send(chatId, "❌ Edit cancelled.", mainMenu());
     return true;
   }
 
   const { key } = pending;
-  await clearPending(userId, chatId);
+  const trimmed = text.trim();
 
-  const newValue = text === "-" ? "" : text.trim();
+  if (trimmed === "-" && !pending.confirmClear) {
+    await setPending(userId, chatId, { ...pending, confirmClear: true });
+    await send(
+      chatId,
+      `⚠️ Clear <b>${esc(key)}</b>?
 
-  try {
-    if (newValue === "") {
-      await vercelDeleteEnv(key);
-      process.env[key] = "";
-    } else {
-      await vercelUpsertEnv(key, newValue);
-      process.env[key] = newValue;
-    }
-    const display = SENSITIVE.has(key) ? "••••••••" : `<code>${esc(newValue || "(cleared)")}</code>`;
-    await send(chatId, `✅ <b>${esc(key)}</b> updated to ${display}`, mainMenu());
-  } catch (err) {
-    await send(chatId, `❌ Failed to save <b>${esc(key)}</b>: ${esc(err.message)}`, mainMenu());
+Send <code>-</code> again to confirm, or send /cancel to abort.`,
+      kb([[{ text: "Cancel", callback_data: "edit" }]])
+    );
+    return true;
   }
 
+  await clearPending(userId, chatId);
+  const newValue = trimmed === "-" && pending.confirmClear ? "" : trimmed;
+
+  await send(chatId, `💾 Saving <b>${esc(key)}</b>…`);
+
+  const result = await saveConfigValue(key, newValue);
+  const display = SENSITIVE.has(key) && newValue ? "••••••••" : `<code>${esc(newValue || "(cleared)")}</code>`;
+  let suffix = "";
+  if (result.vercelError) {
+    suffix = `\n⚠️ Saved to Redis runtime config, but Vercel mirror failed: ${esc(result.vercelError.message)}`;
+  } else if (result.mirroredToVercel) {
+    suffix = "\n🔁 Mirrored to Vercel.";
+  } else if (result.savedToRedis) {
+    suffix = "\n💾 Saved to Redis runtime config.";
+  } else {
+    suffix = "\n⚠️ Redis is unavailable; saved only for this running process.";
+  }
+
+  await send(chatId, `✅ <b>${esc(key)}</b> updated to ${display}${suffix}`, mainMenu());
   return true;
 }
 
 async function handleTest(chatId, messageId) {
-  const chatRaw = process.env.CHAT_ID || "";
+  const chatRaw = await getEffectiveConfig("CHAT_ID");
   const targets = chatRaw.split(",").map(s => s.trim()).filter(Boolean);
 
   if (!targets.length) {

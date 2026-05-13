@@ -36,20 +36,20 @@ function getRedisUrl() {
   );
 }
 
-function getAllowedRepos() {
-  return (process.env.ALLOWED_REPOS || "")
+function getAllowedRepos(raw = process.env.ALLOWED_REPOS || "") {
+  return (raw || "")
     .split(",")
     .map((v) => v.trim())
     .filter(Boolean);
 }
 
-function getAllowedBranch() {
-  const branch = (process.env.ALLOWED_BRANCH || "").trim();
+function getAllowedBranch(raw = process.env.ALLOWED_BRANCH || "") {
+  const branch = (raw || "").trim();
   return branch || null;
 }
 
-function getWorkflowFilter() {
-  const filter = (process.env.WORKFLOW_NAME_FILTER || "").trim();
+function getWorkflowFilter(raw = process.env.WORKFLOW_NAME_FILTER || "") {
+  const filter = (raw || "").trim();
   return filter || null;
 }
 
@@ -83,12 +83,12 @@ function parseChatTargets(raw) {
     });
 }
 
-function onlyFailuresEnabled() {
-  return process.env.ONLY_FAILURES === "true";
+function onlyFailuresEnabled(raw = process.env.ONLY_FAILURES) {
+  return raw === "true";
 }
 
-function lowPrioritySilentEnabled() {
-  const v = process.env.SILENT_LOW_PRIORITY;
+function lowPrioritySilentEnabled(raw = process.env.SILENT_LOW_PRIORITY) {
+  const v = raw;
   if (v === undefined || v === null || v === "") return true;
   return v !== "false";
 }
@@ -240,20 +240,35 @@ async function getRuntimeConfig(key) {
   ]).catch(() => null);
 }
 
-async function getDisabledEvents() {
-  const stored = await getRuntimeConfig("DISABLED_EVENTS");
+async function getRuntimeConfigValues(keys) {
+  const redis = await getRedisClient();
+  if (!redis) return {};
+
+  return Promise.race([
+    redis.hmGet(RUNTIME_CONFIG_KEY, keys),
+    new Promise((resolve) => setTimeout(() => resolve(null), REDIS_RUNTIME_READ_TIMEOUT_MS)),
+  ]).then((values) => {
+    if (!Array.isArray(values)) return {};
+    return Object.fromEntries(keys.map((key, index) => [key, values[index] ?? null]));
+  }).catch(() => ({}));
+}
+
+function runtimeOrEnv(runtimeConfig, key) {
+  return runtimeConfig?.[key] ?? process.env[key] ?? "";
+}
+
+async function getDisabledEvents(runtimeConfig = null) {
+  const stored = runtimeConfig ? runtimeConfig.DISABLED_EVENTS : await getRuntimeConfig("DISABLED_EVENTS");
   const raw = stored ?? process.env.DISABLED_EVENTS ?? "";
   return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
 }
 
-function repoAllowed(fullName) {
-  const allowedRepos = getAllowedRepos();
+function repoAllowed(fullName, allowedRepos = getAllowedRepos()) {
   if (!allowedRepos.length) return true;
   return allowedRepos.includes(fullName);
 }
 
-function shouldTrackWorkflow(name) {
-  const filter = getWorkflowFilter();
+function shouldTrackWorkflow(name, filter = getWorkflowFilter()) {
   if (!filter) return true;
   return (name || "").toLowerCase().includes(filter.toLowerCase());
 }
@@ -775,12 +790,25 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, pong: true });
     }
 
-    const BOT_TOKEN = process.env.BOT_TOKEN;
-    const CHAT_TARGETS = parseChatTargets(process.env.CHAT_ID);
-    const SECRET = process.env.WEBHOOK_SECRET;
-    const allowedBranch = getAllowedBranch();
-    const onlyFailures = onlyFailuresEnabled();
-    const silentLowPriority = lowPrioritySilentEnabled();
+    const runtimeConfig = await getRuntimeConfigValues([
+      "BOT_TOKEN",
+      "CHAT_ID",
+      "WEBHOOK_SECRET",
+      "ALLOWED_REPOS",
+      "ALLOWED_BRANCH",
+      "WORKFLOW_NAME_FILTER",
+      "ONLY_FAILURES",
+      "SILENT_LOW_PRIORITY",
+      "DISABLED_EVENTS",
+    ]);
+    const BOT_TOKEN = runtimeOrEnv(runtimeConfig, "BOT_TOKEN");
+    const CHAT_TARGETS = parseChatTargets(runtimeOrEnv(runtimeConfig, "CHAT_ID"));
+    const SECRET = runtimeOrEnv(runtimeConfig, "WEBHOOK_SECRET");
+    const allowedRepos = getAllowedRepos(runtimeOrEnv(runtimeConfig, "ALLOWED_REPOS"));
+    const allowedBranch = getAllowedBranch(runtimeOrEnv(runtimeConfig, "ALLOWED_BRANCH"));
+    const workflowFilter = getWorkflowFilter(runtimeOrEnv(runtimeConfig, "WORKFLOW_NAME_FILTER"));
+    const onlyFailures = onlyFailuresEnabled(runtimeOrEnv(runtimeConfig, "ONLY_FAILURES"));
+    const silentLowPriority = lowPrioritySilentEnabled(runtimeOrEnv(runtimeConfig, "SILENT_LOW_PRIORITY"));
 
     if (!BOT_TOKEN || !CHAT_TARGETS.length || !SECRET) {
       return res.status(500).json({
@@ -796,13 +824,13 @@ export default async function handler(req, res) {
       return res.status(401).send("Invalid signature");
     }
 
-    const disabledEvents = await getDisabledEvents();
+    const disabledEvents = await getDisabledEvents(runtimeConfig);
     if (disabledEvents.has(event)) {
       return res.status(200).json({ ignored: true, reason: "event_disabled", event });
     }
 
     const repositoryName = req.body?.repository?.full_name;
-    if (repositoryName && !repoAllowed(repositoryName)) {
+    if (repositoryName && !repoAllowed(repositoryName, allowedRepos)) {
       return res.status(200).json({ ignored: true, reason: "repo_not_allowed" });
     }
 
@@ -920,7 +948,7 @@ ${c.url || ""}
         return res.status(200).end();
       }
 
-      if (!shouldTrackWorkflow(wf.name || "")) {
+      if (!shouldTrackWorkflow(wf.name || "", workflowFilter)) {
         return res.status(200).end();
       }
 
