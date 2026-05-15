@@ -797,6 +797,14 @@ async function upsertCheckNotification(botToken, chatTarget, trackingKey, messag
 
   const tracked = await getMessageTracking(trackingKey, chatId);
 
+  // If we've already sent a message for this exact status+conclusion, skip entirely.
+  // This catches GitHub sending identical check_run webhooks with different delivery IDs.
+  if (tracked) {
+    const sameStatus = tracked.lastStatus === currentStatus;
+    const sameConclusion = tracked.lastConclusion === (currentConclusion || null);
+    if (sameStatus && sameConclusion) return;
+  }
+
   if (!tracked) {
     const created = await telegramRequest(
       botToken,
@@ -815,13 +823,6 @@ async function upsertCheckNotification(botToken, chatTarget, trackingKey, messag
       lastConclusion: currentConclusion || null,
     });
 
-    return;
-  }
-
-  const sameStatus = tracked.lastStatus === currentStatus;
-  const sameConclusion = tracked.lastConclusion === (currentConclusion || null);
-
-  if (sameStatus && sameConclusion) {
     return;
   }
 
