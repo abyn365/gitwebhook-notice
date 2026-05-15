@@ -90,6 +90,12 @@ function cleanupMap(map, ttl) {
   }
 }
 
+// ── HTML escaping ─────────────────────────────────────────────────────────────
+
+function esc(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 async function getRedisClient() {
   const url = getRedisUrl();
   if (!url) return null;
@@ -270,18 +276,18 @@ function shouldTrackWorkflow(name, filter = getWorkflowFilter()) {
 
 function mapWorkflowStatus(wf) {
   if (wf.status === "queued") {
-    return { label: "queued", emoji: "⏳" };
+    return { label: "Queued", emoji: "⏳" };
   }
 
   if (wf.status === "in_progress") {
-    return { label: "building", emoji: "🛠️" };
+    return { label: "Building", emoji: "🛠️" };
   }
 
   if (wf.status === "completed") {
     if (wf.conclusion === "success") {
-      return { label: "success", emoji: "✅" };
+      return { label: "Success", emoji: "✅" };
     }
-    return { label: wf.conclusion || "failure", emoji: "❌" };
+    return { label: wf.conclusion || "Failure", emoji: "❌" };
   }
 
   return null;
@@ -299,18 +305,27 @@ function formatDuration(startedAt, endedAt) {
   return `${minutes}m ${seconds}s`;
 }
 
+// ── message builders (all HTML-formatted) ────────────────────────────────────
+
+/**
+ * Workflow messages are edited in-place via Telegram's editMessageText API,
+ * which does NOT support inline keyboards on edited messages in all clients.
+ * We use plain-text URLs here intentionally so the link is always visible.
+ * All other builders use <a href> tags since they are sent once and not edited.
+ */
 function formatWorkflowMessage(repository, wf, status) {
-  const duration = wf.status === "completed" ? formatDuration(wf.run_started_at, wf.updated_at) : "-";
+  const duration = wf.status === "completed" ? formatDuration(wf.run_started_at, wf.updated_at) : "—";
+  const commit = wf.head_commit?.id?.slice(0, 7) || "—";
 
-  return `${status.emoji} GitHub Action
+  return `${status.emoji} <b>GitHub Actions</b>
 
-Repo: ${repository.full_name}
-Workflow: ${wf.name}
-Branch: ${wf.head_branch}
-Status: ${status.label}
-Actor: ${wf.actor?.login || "unknown"}
-Commit: ${wf.head_commit?.id?.slice(0, 7) || "-"}
-Duration: ${duration}
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Workflow:</b> <code>${esc(wf.name)}</code>
+<b>Branch:</b> <code>${esc(wf.head_branch)}</code>
+<b>Status:</b> ${esc(status.label)}
+<b>Actor:</b> <code>${esc(wf.actor?.login || "unknown")}</code>
+<b>Commit:</b> <code>${esc(commit)}</code>
+<b>Duration:</b> <i>${esc(duration)}</i>
 
 ${wf.html_url}`;
 }
@@ -349,14 +364,12 @@ function buildIssueText(repository, issue, action) {
   const emoji = emojiMap[action] || "ℹ️";
   const labels = Array.isArray(issue.labels) ? issue.labels.map((l) => l.name).filter(Boolean) : [];
 
-  return `${emoji} Issue ${action}
+  return `${emoji} <b>Issue ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-Title: ${issue.title}
-Author: ${issue.user?.login || "unknown"}
-State: ${issue.state || "-"}
-
-${labels.length ? `Labels: ${labels.join(", ")}\n` : ""}${issue.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Title:</b> <a href="${esc(issue.html_url)}">${esc(issue.title)}</a>
+<b>Author:</b> <code>${esc(issue.user?.login || "unknown")}</code>
+<b>State:</b> <i>${esc(issue.state || "—")}</i>${labels.length ? `\n<b>Labels:</b> ${labels.map((l) => `<code>${esc(l)}</code>`).join(", ")}` : ""}`;
 }
 
 function buildIssueCommentText(repository, issue, comment, action) {
@@ -367,15 +380,13 @@ function buildIssueCommentText(repository, issue, comment, action) {
   };
 
   const emoji = emojiMap[action] || "💬";
+  const url = comment.html_url || issue.html_url;
 
-  return `${emoji} Issue Comment ${action}
+  return `${emoji} <b>Issue Comment ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-Issue: #${issue.number}
-Title: ${issue.title}
-Author: ${comment.user?.login || "unknown"}
-
-${comment.html_url || issue.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Issue:</b> <a href="${esc(url)}">#${esc(String(issue.number))} ${esc(issue.title)}</a>
+<b>Author:</b> <code>${esc(comment.user?.login || "unknown")}</code>`;
 }
 
 function buildPullRequestText(repository, pr, action) {
@@ -404,14 +415,19 @@ function buildPullRequestText(repository, pr, action) {
     emoji = "🧹";
   }
 
-  return `${emoji} Pull Request ${label}
+  const branch = `<code>${esc(pr.head?.ref || "?")}</code> → <code>${esc(pr.base?.ref || "?")}</code>`;
+  const extras = [
+    pr.draft ? "<i>Draft</i>" : null,
+    merged && pr.merged_by?.login ? `<b>Merged by:</b> <code>${esc(pr.merged_by.login)}</code>` : null,
+    isRevert ? "<i>⏪ Revert PR</i>" : null,
+  ].filter(Boolean);
 
-Repo: ${repository.full_name}
-Title: ${pr.title}
-Author: ${pr.user?.login || "unknown"}
-Branch: ${pr.head?.ref || "?"} → ${pr.base?.ref || "?"}
-${pr.draft ? "Draft: yes\n" : ""}${merged && pr.merged_by?.login ? `Merged by: ${pr.merged_by.login}\n` : ""}${isRevert ? "Revert: yes\n" : ""}
-${pr.html_url}`;
+  return `${emoji} <b>Pull Request ${esc(label)}</b>
+
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Title:</b> <a href="${esc(pr.html_url)}">${esc(pr.title)}</a>
+<b>Author:</b> <code>${esc(pr.user?.login || "unknown")}</code>
+<b>Branch:</b> ${branch}${extras.length ? `\n${extras.join("\n")}` : ""}`;
 }
 
 function buildPullRequestReviewText(repository, pr, review, action) {
@@ -422,16 +438,14 @@ function buildPullRequestReviewText(repository, pr, review, action) {
   };
 
   const emoji = emojiMap[action] || "🧪";
+  const url = review.html_url || pr.html_url;
 
-  return `${emoji} PR Review ${action}
+  return `${emoji} <b>PR Review ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-PR: #${pr.number}
-Title: ${pr.title}
-Reviewer: ${review.user?.login || "unknown"}
-State: ${review.state || "-"}
-
-${review.html_url || pr.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>PR:</b> <a href="${esc(url)}">#${esc(String(pr.number))} ${esc(pr.title)}</a>
+<b>Reviewer:</b> <code>${esc(review.user?.login || "unknown")}</code>
+<b>State:</b> <i>${esc(review.state || "—")}</i>`;
 }
 
 function buildPullRequestReviewCommentText(repository, pr, comment, action) {
@@ -442,15 +456,13 @@ function buildPullRequestReviewCommentText(repository, pr, comment, action) {
   };
 
   const emoji = emojiMap[action] || "💬";
+  const url = comment.html_url || pr.html_url;
 
-  return `${emoji} PR Review Comment ${action}
+  return `${emoji} <b>PR Review Comment ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-PR: #${pr.number}
-Title: ${pr.title}
-Author: ${comment.user?.login || "unknown"}
-
-${comment.html_url || pr.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>PR:</b> <a href="${esc(url)}">#${esc(String(pr.number))} ${esc(pr.title)}</a>
+<b>Author:</b> <code>${esc(comment.user?.login || "unknown")}</code>`;
 }
 
 function buildDiscussionText(repository, discussion, action) {
@@ -471,14 +483,12 @@ function buildDiscussionText(repository, discussion, action) {
 
   const emoji = emojiMap[action] || "💬";
 
-  return `${emoji} Discussion ${action}
+  return `${emoji} <b>Discussion ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-Title: ${discussion.title}
-Author: ${discussion.user?.login || "unknown"}
-Category: ${discussion.category?.name || "-"}
-
-${discussion.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Title:</b> <a href="${esc(discussion.html_url)}">${esc(discussion.title)}</a>
+<b>Author:</b> <code>${esc(discussion.user?.login || "unknown")}</code>
+<b>Category:</b> <i>${esc(discussion.category?.name || "—")}</i>`;
 }
 
 function buildDiscussionCommentText(repository, discussion, comment, action) {
@@ -489,120 +499,124 @@ function buildDiscussionCommentText(repository, discussion, comment, action) {
   };
 
   const emoji = emojiMap[action] || "💬";
+  const url = comment.html_url || discussion.html_url;
 
-  return `${emoji} Discussion Comment ${action}
+  return `${emoji} <b>Discussion Comment ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-Discussion: ${discussion.title}
-Author: ${comment.user?.login || "unknown"}
-
-${comment.html_url || discussion.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Discussion:</b> <a href="${esc(url)}">${esc(discussion.title)}</a>
+<b>Author:</b> <code>${esc(comment.user?.login || "unknown")}</code>`;
 }
 
 function buildReleaseText(repository, release, action) {
-  return `📦 Release ${action}
+  return `📦 <b>Release ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-Tag: ${release.tag_name}
-Name: ${release.name || "untitled"}
-Author: ${release.author?.login || "unknown"}
-Prerelease: ${release.prerelease ? "yes" : "no"}
-
-${release.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Tag:</b> <code>${esc(release.tag_name)}</code>
+<b>Name:</b> <a href="${esc(release.html_url)}">${esc(release.name || "untitled")}</a>
+<b>Author:</b> <code>${esc(release.author?.login || "unknown")}</code>
+<b>Pre-release:</b> <i>${release.prerelease ? "yes" : "no"}</i>`;
 }
 
 function buildDeploymentStatusText(repository, deployment, deploymentStatus) {
-  return `🚀 Deployment ${deploymentStatus.state}
+  const stateEmoji = {
+    success: "✅",
+    failure: "❌",
+    error: "🔥",
+    pending: "⏳",
+    in_progress: "🛠️",
+    queued: "⏳",
+    waiting: "⏳",
+  }[deploymentStatus.state] || "🚀";
 
-Repo: ${repository.full_name}
-Environment: ${deployment.environment || deploymentStatus.environment || "unknown"}
-Description: ${deploymentStatus.description || deployment.description || "-"}
-Target URL: ${deploymentStatus.target_url || deployment.payload?.url || "-"}
+  const targetUrl = deploymentStatus.environment_url || deploymentStatus.target_url || deployment.payload?.url || "";
+  const description = deploymentStatus.description || deployment.description || "—";
 
-${deploymentStatus.environment_url || deploymentStatus.target_url || deployment.payload?.url || ""}`;
+  return `${stateEmoji} <b>Deployment ${esc(deploymentStatus.state)}</b>
+
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Environment:</b> <code>${esc(deployment.environment || deploymentStatus.environment || "unknown")}</code>
+<b>Description:</b> <i>${esc(description)}</i>${targetUrl ? `\n<b>URL:</b> <a href="${esc(targetUrl)}">${esc(targetUrl)}</a>` : ""}`;
 }
 
 function buildDependabotText(repository, alert) {
-  return `🚨 Dependabot Alert
+  const severityEmoji = {
+    critical: "🔴",
+    high: "🟠",
+    medium: "🟡",
+    low: "🟢",
+  }[alert.security_advisory?.severity?.toLowerCase()] || "🚨";
 
-Repo: ${repository.full_name}
-Package: ${alert.dependency?.package?.name || "unknown"}
-Severity: ${alert.security_advisory?.severity || "unknown"}
-Summary: ${alert.security_advisory?.summary || "-"}
-State: ${alert.state || "unknown"}
+  return `${severityEmoji} <b>Dependabot Alert</b>
 
-${alert.html_url || ""}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Package:</b> <code>${esc(alert.dependency?.package?.name || "unknown")}</code>
+<b>Severity:</b> <i>${esc(alert.security_advisory?.severity || "unknown")}</i>
+<b>Summary:</b> ${esc(alert.security_advisory?.summary || "—")}
+<b>State:</b> <code>${esc(alert.state || "unknown")}</code>`;
 }
 
 function buildSecretScanningText(repository, alert) {
-  return `🔑 Secret Scanning Alert
+  return `🔑 <b>Secret Scanning Alert</b>
 
-Repo: ${repository.full_name}
-Secret Type: ${alert.secret_type || "unknown"}
-State: ${alert.state || "unknown"}
-Resolution: ${alert.resolution || "-"}
-
-${alert.html_url || ""}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Secret type:</b> <code>${esc(alert.secret_type || "unknown")}</code>
+<b>State:</b> <code>${esc(alert.state || "unknown")}</code>
+<b>Resolution:</b> <i>${esc(alert.resolution || "—")}</i>`;
 }
 
 function buildCodeScanningText(repository, alert) {
-  return `🛡️ Code Scanning Alert
+  const severityEmoji = {
+    critical: "🔴",
+    high: "🟠",
+    medium: "🟡",
+    low: "🟢",
+  }[alert.rule?.security_severity_level?.toLowerCase() || alert.rule?.severity?.toLowerCase()] || "🛡️";
 
-Repo: ${repository.full_name}
-Rule: ${alert.rule?.description || alert.rule?.id || "unknown"}
-Severity: ${alert.rule?.security_severity_level || alert.rule?.severity || "unknown"}
-State: ${alert.state || "unknown"}
+  return `${severityEmoji} <b>Code Scanning Alert</b>
 
-${alert.html_url || ""}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Rule:</b> <code>${esc(alert.rule?.description || alert.rule?.id || "unknown")}</code>
+<b>Severity:</b> <i>${esc(alert.rule?.security_severity_level || alert.rule?.severity || "unknown")}</i>
+<b>State:</b> <code>${esc(alert.state || "unknown")}</code>`;
 }
 
 function buildStarText(repository, sender) {
-  return `⭐ Star
+  return `⭐ <b>New Star</b>
 
-Repo: ${repository.full_name}
-User: ${sender?.login || "unknown"}
-
-${repository.html_url}`;
+<b>Repo:</b> <a href="${esc(repository.html_url)}">${esc(repository.full_name)}</a>
+<b>By:</b> <code>${esc(sender?.login || "unknown")}</code>
+<i>Total: ${esc(String(repository.stargazers_count ?? "?"))} ⭐</i>`;
 }
 
 function buildForkText(repository, forkee, sender) {
-  return `🍴 Fork
+  return `🍴 <b>Fork</b>
 
-Repo: ${repository.full_name}
-Fork: ${forkee?.full_name || forkee?.html_url || "unknown"}
-By: ${sender?.login || "unknown"}
-
-${forkee?.html_url || repository.html_url}`;
+<b>Repo:</b> <a href="${esc(repository.html_url)}">${esc(repository.full_name)}</a>
+<b>Fork:</b> <a href="${esc(forkee?.html_url || repository.html_url)}">${esc(forkee?.full_name || "unknown")}</a>
+<b>By:</b> <code>${esc(sender?.login || "unknown")}</code>`;
 }
 
 function buildCreateText(repository, refType, ref) {
-  return `✨ Created
+  return `✨ <b>Created ${esc(refType)}</b>
 
-Repo: ${repository.full_name}
-Type: ${refType}
-Name: ${ref}
-
-${repository.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Name:</b> <code>${esc(ref)}</code>`;
 }
 
 function buildDeleteText(repository, refType, ref) {
-  return `🗑️ Deleted
+  return `🗑️ <b>Deleted ${esc(refType)}</b>
 
-Repo: ${repository.full_name}
-Type: ${refType}
-Name: ${ref}
-
-${repository.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Name:</b> <code>${esc(ref)}</code>`;
 }
 
 function buildBranchProtectionText(repository, rule, action) {
-  return `🛡️ Branch Protection Rule ${action}
+  return `🛡️ <b>Branch Protection Rule ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-Pattern: ${rule.pattern || "-"}
-Name: ${rule.name || "-"}
-
-${repository.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Pattern:</b> <code>${esc(rule.pattern || "—")}</code>
+<b>Name:</b> <i>${esc(rule.name || "—")}</i>`;
 }
 
 function buildCheckRunText(repository, checkRun, status, conclusion) {
@@ -610,15 +624,14 @@ function buildCheckRunText(repository, checkRun, status, conclusion) {
   if (status === "in_progress") emoji = "🛠️";
   else if (status === "completed") emoji = conclusion === "success" ? "✅" : "❌";
 
-  const conclusionStr = conclusion ? ` / ${conclusion}` : "";
+  const conclusionStr = conclusion ? ` / <i>${esc(conclusion)}</i>` : "";
+  const url = checkRun.html_url || repository.html_url;
 
-  return `${emoji} Check Run
+  return `${emoji} <b>Check Run</b>
 
-Repo: ${repository.full_name}
-Name: ${checkRun.name}
-Status: ${status}${conclusionStr}
-
-${checkRun.html_url || repository.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Name:</b> <a href="${esc(url)}">${esc(checkRun.name)}</a>
+<b>Status:</b> <code>${esc(status)}</code>${conclusionStr}`;
 }
 
 function buildCheckSuiteText(repository, checkSuite, status, conclusion) {
@@ -626,44 +639,36 @@ function buildCheckSuiteText(repository, checkSuite, status, conclusion) {
   if (status === "in_progress") emoji = "🛠️";
   else if (status === "completed") emoji = conclusion === "success" ? "✅" : "❌";
 
-  const conclusionStr = conclusion ? ` / ${conclusion}` : "";
+  const conclusionStr = conclusion ? ` / <i>${esc(conclusion)}</i>` : "";
 
-  return `${emoji} Check Suite
+  return `${emoji} <b>Check Suite</b>
 
-Repo: ${repository.full_name}
-Head branch: ${checkSuite.head_branch || "-"}
-Status: ${status}${conclusionStr}
-
-${checkSuite.url || repository.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>Branch:</b> <code>${esc(checkSuite.head_branch || "—")}</code>
+<b>Status:</b> <code>${esc(status)}</code>${conclusionStr}`;
 }
 
 function buildRepoEventText(repository, action) {
-  return `📁 Repository ${action}
+  return `📁 <b>Repository ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-Default branch: ${repository.default_branch || "-"}
-
-${repository.html_url}`;
+<b>Repo:</b> <a href="${esc(repository.html_url)}">${esc(repository.full_name)}</a>
+<b>Default branch:</b> <code>${esc(repository.default_branch || "—")}</code>`;
 }
 
 function buildMemberEventText(eventName, action, repository, subject) {
-  return `👥 ${eventName} ${action}
+  return `👥 <b>${esc(eventName)} ${esc(action)}</b>
 
-Repo: ${repository.full_name}
-User/Team: ${subject}
-
-${repository.html_url}`;
+<b>Repo:</b> <code>${esc(repository.full_name)}</code>
+<b>User/Team:</b> <code>${esc(subject)}</code>`;
 }
 
 function buildGenericOrgEventText(eventName, action, body) {
   const org = body.organization?.login || body.organization?.name || body.sender?.login || "unknown";
   const repo = body.repository?.full_name || null;
 
-  return `${eventName} ${action}
+  return `<b>${esc(eventName)} ${esc(action)}</b>
 
-Org: ${org}${repo ? `\nRepo: ${repo}` : ""}
-
-${body.organization?.html_url || body.repository?.html_url || ""}`;
+<b>Org:</b> <code>${esc(org)}</code>${repo ? `\n<b>Repo:</b> <code>${esc(repo)}</code>` : ""}`;
 }
 
 async function telegramRequest(botToken, method, payload) {
@@ -695,6 +700,7 @@ function buildTelegramPayload(chatId, text, { silent = false, replyMarkup = null
   const payload = {
     chat_id: chatId,
     text,
+    parse_mode: "HTML",
     disable_web_page_preview: disableWebPagePreview,
     disable_notification: silent,
   };
@@ -762,6 +768,7 @@ async function upsertWorkflowNotification(botToken, chatTarget, workflowRun, mes
       chat_id: chatId,
       message_id: tracked.messageId,
       text: message,
+      parse_mode: "HTML",
       disable_web_page_preview: true,
     });
   } else {
@@ -785,11 +792,6 @@ async function upsertWorkflowNotification(botToken, chatTarget, workflowRun, mes
   });
 }
 
-/**
- * Upsert a Telegram message for check_run or check_suite events.
- * Tracks by (trackingKey, chatId). Edits the existing message when
- * status/conclusion changes; sends a new one on first occurrence.
- */
 async function upsertCheckNotification(botToken, chatTarget, trackingKey, message, currentStatus, currentConclusion, replyMarkup = null) {
   const { chatId, threadId } = chatTarget;
 
@@ -828,6 +830,7 @@ async function upsertCheckNotification(botToken, chatTarget, trackingKey, messag
       chat_id: chatId,
       message_id: tracked.messageId,
       text: message,
+      parse_mode: "HTML",
       disable_web_page_preview: true,
     };
     if (replyMarkup) editPayload.reply_markup = replyMarkup;
@@ -926,7 +929,7 @@ export default async function handler(req, res) {
       const text = buildStarText(repository, req.body.sender);
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: silentLowPriority,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
       return res.status(200).json({ ok: true });
     }
@@ -935,7 +938,7 @@ export default async function handler(req, res) {
       const text = buildForkText(repository, req.body.forkee, req.body.sender);
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: silentLowPriority,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
       return res.status(200).json({ ok: true });
     }
@@ -944,7 +947,7 @@ export default async function handler(req, res) {
       const text = buildCreateText(repository, req.body.ref_type, req.body.ref);
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
       return res.status(200).json({ ok: true });
     }
@@ -953,7 +956,7 @@ export default async function handler(req, res) {
       const text = buildDeleteText(repository, req.body.ref_type, req.body.ref);
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
       return res.status(200).json({ ok: true });
     }
@@ -973,18 +976,17 @@ export default async function handler(req, res) {
         importantKeywords.some((k) => (c.message || "").toLowerCase().includes(k))
       );
 
-      let text = `${important ? "🚨 IMPORTANT PUSH" : "🚀 Git Push"}
-
-Repo: ${repository.full_name}
-Branch: ${branch}
-
-`;
+      let text = `${important ? "🚨" : "🚀"} <b>${important ? "Important Push" : "Git Push"}</b>\n\n`;
+      text += `<b>Repo:</b> <code>${esc(repository.full_name)}</code>\n`;
+      text += `<b>Branch:</b> <code>${esc(branch)}</code>\n\n`;
 
       for (const c of commits) {
-        text += `• ${c.author?.name || "unknown"}: ${c.message || "(no message)"}
-${c.url || ""}
-
-`;
+        const shortMsg = (c.message || "(no message)").split("\n")[0];
+        const commitUrl = c.url || "";
+        const sha = c.id?.slice(0, 7) || "?";
+        text += commitUrl
+          ? `• <a href="${esc(commitUrl)}"><code>${esc(sha)}</code></a> <b>${esc(c.author?.name || "unknown")}:</b> ${esc(shortMsg)}\n`
+          : `• <code>${esc(sha)}</code> <b>${esc(c.author?.name || "unknown")}:</b> ${esc(shortMsg)}\n`;
       }
 
       const added = headCommit?.added || [];
@@ -993,18 +995,19 @@ ${c.url || ""}
       const changedFiles = [...added, ...modified, ...removed].slice(0, 10);
 
       if (changedFiles.length) {
-        text += `Changed files:\n`;
+        text += `\n<b>Changed files:</b>\n`;
         for (const file of changedFiles) {
-          text += `• ${file}\n`;
+          text += `  <code>${esc(file)}</code>\n`;
         }
-        text += `\n`;
       }
 
-      text += `View push:\n${compare || repository.html_url || ""}`;
+      if (compare) {
+        text += `\n<a href="${esc(compare)}">View push →</a>`;
+      }
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
 
       return res.status(200).json({ ok: true });
@@ -1045,23 +1048,10 @@ ${c.url || ""}
       const action = req.body.action;
 
       const allowedActions = [
-        "opened",
-        "closed",
-        "reopened",
-        "review_requested",
-        "review_request_removed",
-        "ready_for_review",
-        "converted_to_draft",
-        "synchronize",
-        "assigned",
-        "unassigned",
-        "labeled",
-        "unlabeled",
-        "locked",
-        "unlocked",
-        "edited",
-        "auto_merge_enabled",
-        "auto_merge_disabled",
+        "opened", "closed", "reopened", "review_requested", "review_request_removed",
+        "ready_for_review", "converted_to_draft", "synchronize", "assigned", "unassigned",
+        "labeled", "unlabeled", "locked", "unlocked", "edited",
+        "auto_merge_enabled", "auto_merge_disabled",
       ];
 
       if (!allowedActions.includes(action)) {
@@ -1073,7 +1063,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[
             { text: isRevert ? "Open Revert PR" : "Open PR", url: pr.html_url },
@@ -1097,7 +1087,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[{ text: "Open PR", url: pr.html_url }]],
         },
@@ -1119,7 +1109,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[{ text: "Open PR", url: pr.html_url }]],
         },
@@ -1137,21 +1127,9 @@ ${c.url || ""}
       }
 
       const allowedActions = [
-        "opened",
-        "closed",
-        "reopened",
-        "edited",
-        "labeled",
-        "unlabeled",
-        "assigned",
-        "unassigned",
-        "locked",
-        "unlocked",
-        "pinned",
-        "unpinned",
-        "transferred",
-        "milestoned",
-        "demilestoned",
+        "opened", "closed", "reopened", "edited", "labeled", "unlabeled",
+        "assigned", "unassigned", "locked", "unlocked", "pinned", "unpinned",
+        "transferred", "milestoned", "demilestoned",
       ];
 
       if (!allowedActions.includes(action)) {
@@ -1162,7 +1140,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[{ text: "Open Issue", url: issue.html_url }]],
         },
@@ -1188,7 +1166,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[{ text: "Open Issue", url: issue.html_url }]],
         },
@@ -1202,18 +1180,8 @@ ${c.url || ""}
       const action = req.body.action;
 
       const allowedActions = [
-        "created",
-        "edited",
-        "answered",
-        "category_changed",
-        "deleted",
-        "transferred",
-        "pinned",
-        "unpinned",
-        "locked",
-        "unlocked",
-        "labeled",
-        "unlabeled",
+        "created", "edited", "answered", "category_changed", "deleted", "transferred",
+        "pinned", "unpinned", "locked", "unlocked", "labeled", "unlabeled",
       ];
 
       if (!allowedActions.includes(action)) {
@@ -1223,7 +1191,7 @@ ${c.url || ""}
       const text = buildDiscussionText(repository, discussion, action);
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[{ text: "Open Discussion", url: discussion.html_url }]],
         },
@@ -1245,7 +1213,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[{ text: "Open Discussion", url: discussion.html_url }]],
         },
@@ -1270,7 +1238,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: {
           inline_keyboard: [[{ text: "Open Release", url: release.html_url }]],
         },
@@ -1292,12 +1260,13 @@ ${c.url || ""}
       }
 
       const text = buildDeploymentStatusText(repository, deployment, deploymentStatus);
+      const targetUrl = deploymentStatus.target_url;
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
-        replyMarkup: deploymentStatus.target_url
-          ? { inline_keyboard: [[{ text: "Open Deployment", url: deploymentStatus.target_url }]] }
+        disableWebPagePreview: true,
+        replyMarkup: targetUrl
+          ? { inline_keyboard: [[{ text: "Open Deployment", url: targetUrl }]] }
           : undefined,
       });
 
@@ -1372,7 +1341,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
 
       return res.status(200).json({ ok: true });
@@ -1386,7 +1355,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: alert.html_url
           ? { inline_keyboard: [[{ text: "Open Alert", url: alert.html_url }]] }
           : undefined,
@@ -1403,7 +1372,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: alert.html_url
           ? { inline_keyboard: [[{ text: "Open Alert", url: alert.html_url }]] }
           : undefined,
@@ -1420,7 +1389,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
         replyMarkup: alert.html_url
           ? { inline_keyboard: [[{ text: "Open Alert", url: alert.html_url }]] }
           : undefined,
@@ -1441,7 +1410,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: true,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
 
       return res.status(200).json({ ok: true });
@@ -1453,7 +1422,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: true,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
 
       return res.status(200).json({ ok: true });
@@ -1461,7 +1430,10 @@ ${c.url || ""}
 
     if (event === "repository") {
       const action = req.body.action;
-      const allowedActions = ["created", "deleted", "publicized", "privatized", "renamed", "archived", "unarchived", "edited", "transferred"];
+      const allowedActions = [
+        "created", "deleted", "publicized", "privatized", "renamed",
+        "archived", "unarchived", "edited", "transferred",
+      ];
 
       if (!allowedActions.includes(action)) {
         return res.status(200).end();
@@ -1471,7 +1443,7 @@ ${c.url || ""}
 
       await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
         silent: false,
-        disableWebPagePreview: false,
+        disableWebPagePreview: true,
       });
 
       return res.status(200).json({ ok: true });
