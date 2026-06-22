@@ -1,10 +1,10 @@
-# GitHub → Telegram Webhook Notifier
+# GitHub → Telegram + Discord Webhook Notifier
 
 A small Vercel app that receives GitHub webhooks and sends useful Telegram notifications. It supports Redis-backed deduplication, GitHub Actions status updates, Telegram groups/topics, and an optional Telegram admin bot for runtime configuration.
 
 ## What it does
 
-- Sends GitHub events to one or more Telegram chats.
+- Sends GitHub events to one or more Telegram chats and/or Discord webhooks.
 - Deduplicates deliveries with Redis when configured.
 - Tracks GitHub Actions workflows and edits the same Telegram message as status changes.
 - Filters by repository, branch, workflow name, failure-only mode, and disabled event types.
@@ -85,6 +85,9 @@ ONLY_FAILURES=false
 SILENT_LOW_PRIORITY=true
 DISABLED_EVENTS=
 
+# Telegram and/or Discord targets
+DISCORD_WEBHOOK_URLS=https://discord.com/api/webhooks/...
+
 # Optional Telegram admin bot
 ADMIN_USER_IDS=123456789
 DASHBOARD_PASSWORD=change_me_too
@@ -97,10 +100,13 @@ VERCEL_TEAM_ID=
 
 ## Environment variables
 
+> At least one notification target must be configured: `CHAT_ID` for Telegram, `DISCORD_WEBHOOK_URLS` for Discord, or both. `BOT_TOKEN` is only required when Telegram chat targets are used.
+
 | Variable | Required | Description |
 | --- | --- | --- |
 | `BOT_TOKEN` | Yes | Telegram bot token. |
-| `CHAT_ID` | Yes | One or more chat IDs, comma-separated. Use `chatId:threadId` for forum topics. |
+| `CHAT_ID` | No* | One or more Telegram chat IDs, comma-separated. Use `chatId:threadId` for forum topics. |
+| `DISCORD_WEBHOOK_URLS` | No* | One or more Discord webhook URLs, comma-separated. |
 | `WEBHOOK_SECRET` | Yes | Shared secret used by GitHub webhook signature validation and Telegram admin webhook secret token. |
 | `BOT_USERNAME` | Recommended | Bot username without `@`; improves group command routing. |
 | `REDIS_URL` | Recommended | Redis connection string. `UPSTASH_REDIS_URL` and `webhook_REDIS_URL` are also supported. |

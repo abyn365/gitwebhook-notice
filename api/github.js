@@ -64,10 +64,18 @@ function parseChatTargets(raw) {
         const chatId = entry.slice(0, colonIdx);
         const threadId = Number(entry.slice(colonIdx + 1));
         if (Number.isFinite(threadId) && threadId > 0) {
-          return { chatId, threadId };
+          return {
+            provider: "telegram",
+            chatId,
+            threadId,
+          };
         }
       }
-      return { chatId: entry, threadId: null };
+      return {
+        provider: "telegram",
+        chatId: entry,
+        threadId: null,
+      };
     });
 }
 
@@ -93,7 +101,57 @@ function cleanupMap(map, ttl) {
 // ── HTML escaping ─────────────────────────────────────────────────────────────
 
 function esc(s) {
-  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function decodeHtmlEntities(s) {
+  return String(s ?? "")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function htmlToDiscordText(html, maxLength = 1900) {
+  let text = String(html ?? "");
+
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/<\/(p|div|li|h[1-6])>/gi, "\n");
+  text = text.replace(/<a\s+href="([^"]+)">([\s\S]*?)<\/a>/gi, (_, href, label) => {
+    return `${label} (${href})`;
+  });
+  text = text.replace(/<\/?(b|strong|i|em)>/gi, "");
+  text = text.replace(/<code>([\s\S]*?)<\/code>/gi, (_, code) => `\`${code.replace(/`/g, "\\`")}\``);
+  text = text.replace(/<[^>]+>/g, "");
+  text = decodeHtmlEntities(text);
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+
+  if (text.length > maxLength) {
+    text = `${text.slice(0, maxLength - 25)}…\n\n(truncated for Discord)`;
+  }
+
+  return text;
+}
+
+function parseDiscordTargets(raw) {
+  return (raw || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .map((url) => {
+      const id = crypto.createHash("sha256").update(url).digest("hex").slice(0, 12);
+      return {
+        provider: "discord",
+        chatId: `discord:${id}`,
+        url,
+      };
+    });
 }
 
 async function getRedisClient() {
@@ -716,39 +774,104 @@ function buildTelegramPayload(chatId, text, { silent = false, replyMarkup = null
   return payload;
 }
 
+function buildDiscordPayload(text) {
+  return {
+    content: htmlToDiscordText(text),
+    allowed_mentions: { parse: [] },
+  };
+}
+
+async function discordRequest(webhookUrl, method, payload, messageId = null) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  const endpoint = method === "POST"
+    ? `${webhookUrl}?wait=true`
+    : `${webhookUrl}/messages/${messageId}`;
+
+  try {
+    const response = await fetch(endpoint, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Discord webhook ${method} failed: ${response.status} ${errorText}`);
+    }
+
+    return response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractMessageId(response) {
+  return response?.result?.message_id ?? response?.id ?? null;
+}
+
+async function sendNotificationMessage(botToken, target, text, options = {}) {
+  if (target.provider === "discord") {
+    return discordRequest(target.url, "POST", buildDiscordPayload(text));
+  }
+
+  if (!botToken) {
+    throw new Error("Telegram bot token is missing");
+  }
+
+  return telegramRequest(
+    botToken,
+    "sendMessage",
+    buildTelegramPayload(target.chatId, text, { ...options, threadId: target.threadId })
+  );
+}
+
+async function editNotificationMessage(botToken, target, messageId, text, options = {}) {
+  if (target.provider === "discord") {
+    return discordRequest(target.url, "PATCH", buildDiscordPayload(text), messageId);
+  }
+
+  if (!botToken) {
+    throw new Error("Telegram bot token is missing");
+  }
+
+  return telegramRequest(botToken, "editMessageText", {
+    chat_id: target.chatId,
+    message_id: messageId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: options.disableWebPagePreview ?? true,
+    ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+  });
+}
+
 async function sendToAllChats(botToken, chatTargets, text, options = {}) {
-  for (const { chatId, threadId } of chatTargets) {
+  for (const target of chatTargets) {
     try {
-      await telegramRequest(
-        botToken,
-        "sendMessage",
-        buildTelegramPayload(chatId, text, { ...options, threadId })
-      );
+      await sendNotificationMessage(botToken, target, text, options);
     } catch (error) {
-      console.error(`Failed sending to ${chatId}${threadId ? `:${threadId}` : ""}:`, error);
+      console.error(`Failed sending to ${target.provider}:${target.chatId}:`, error);
     }
   }
 }
 
 async function upsertWorkflowNotification(botToken, chatTarget, workflowRun, message) {
-  const { chatId, threadId } = chatTarget;
+  const { chatId } = chatTarget;
   cleanupMap(workflowMessageMap, WORKFLOW_MESSAGE_TTL_MS);
 
   const tracked = await getWorkflowTracking(workflowRun.id, chatId);
 
   if (!tracked) {
-    const created = await telegramRequest(
-      botToken,
-      "sendMessage",
-      buildTelegramPayload(chatId, message, {
-        silent: false,
-        disableWebPagePreview: true,
-        threadId,
-      })
-    );
+    const created = await sendNotificationMessage(botToken, chatTarget, message, {
+      silent: false,
+      disableWebPagePreview: true,
+    });
 
     await saveWorkflowTracking(workflowRun.id, chatId, {
-      messageId: created.result?.message_id,
+      messageId: extractMessageId(created),
       lastStatus: workflowRun.status,
       lastConclusion: workflowRun.conclusion || null,
     });
@@ -764,25 +887,16 @@ async function upsertWorkflowNotification(botToken, chatTarget, workflowRun, mes
   }
 
   if (tracked.messageId) {
-    await telegramRequest(botToken, "editMessageText", {
-      chat_id: chatId,
-      message_id: tracked.messageId,
-      text: message,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
+    await editNotificationMessage(botToken, chatTarget, tracked.messageId, message, {
+      disableWebPagePreview: true,
     });
   } else {
-    const created = await telegramRequest(
-      botToken,
-      "sendMessage",
-      buildTelegramPayload(chatId, message, {
-        silent: false,
-        disableWebPagePreview: true,
-        threadId,
-      })
-    );
+    const created = await sendNotificationMessage(botToken, chatTarget, message, {
+      silent: false,
+      disableWebPagePreview: true,
+    });
 
-    tracked.messageId = created.result?.message_id;
+    tracked.messageId = extractMessageId(created);
   }
 
   await saveWorkflowTracking(workflowRun.id, chatId, {
@@ -793,7 +907,7 @@ async function upsertWorkflowNotification(botToken, chatTarget, workflowRun, mes
 }
 
 async function upsertCheckNotification(botToken, chatTarget, trackingKey, message, currentStatus, currentConclusion, replyMarkup = null) {
-  const { chatId, threadId } = chatTarget;
+  const { chatId } = chatTarget;
 
   const tracked = await getMessageTracking(trackingKey, chatId);
 
@@ -806,19 +920,14 @@ async function upsertCheckNotification(botToken, chatTarget, trackingKey, messag
   }
 
   if (!tracked) {
-    const created = await telegramRequest(
-      botToken,
-      "sendMessage",
-      buildTelegramPayload(chatId, message, {
-        silent: false,
-        disableWebPagePreview: true,
-        threadId,
-        replyMarkup,
-      })
-    );
+    const created = await sendNotificationMessage(botToken, chatTarget, message, {
+      silent: false,
+      disableWebPagePreview: true,
+      replyMarkup,
+    });
 
     await saveMessageTracking(trackingKey, chatId, {
-      messageId: created.result?.message_id,
+      messageId: extractMessageId(created),
       lastStatus: currentStatus,
       lastConclusion: currentConclusion || null,
     });
@@ -827,27 +936,17 @@ async function upsertCheckNotification(botToken, chatTarget, trackingKey, messag
   }
 
   if (tracked.messageId) {
-    const editPayload = {
-      chat_id: chatId,
-      message_id: tracked.messageId,
-      text: message,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    };
-    if (replyMarkup) editPayload.reply_markup = replyMarkup;
-    await telegramRequest(botToken, "editMessageText", editPayload);
+    await editNotificationMessage(botToken, chatTarget, tracked.messageId, message, {
+      disableWebPagePreview: true,
+      replyMarkup,
+    });
   } else {
-    const created = await telegramRequest(
-      botToken,
-      "sendMessage",
-      buildTelegramPayload(chatId, message, {
-        silent: false,
-        disableWebPagePreview: true,
-        threadId,
-        replyMarkup,
-      })
-    );
-    tracked.messageId = created.result?.message_id;
+    const created = await sendNotificationMessage(botToken, chatTarget, message, {
+      silent: false,
+      disableWebPagePreview: true,
+      replyMarkup,
+    });
+    tracked.messageId = extractMessageId(created);
   }
 
   await saveMessageTracking(trackingKey, chatId, {
@@ -868,6 +967,8 @@ export default async function handler(req, res) {
     const runtimeConfig = await getRuntimeConfigValues([
       "BOT_TOKEN",
       "CHAT_ID",
+      "DISCORD_WEBHOOK_URLS",
+      "DISCORD_WEBHOOK_URL",
       "WEBHOOK_SECRET",
       "ALLOWED_REPOS",
       "ALLOWED_BRANCH",
@@ -877,7 +978,11 @@ export default async function handler(req, res) {
       "DISABLED_EVENTS",
     ]);
     const BOT_TOKEN = runtimeOrEnv(runtimeConfig, "BOT_TOKEN");
-    const CHAT_TARGETS = parseChatTargets(runtimeOrEnv(runtimeConfig, "CHAT_ID"));
+    const TELEGRAM_TARGETS = parseChatTargets(runtimeOrEnv(runtimeConfig, "CHAT_ID"));
+    const DISCORD_TARGETS = parseDiscordTargets(
+      runtimeOrEnv(runtimeConfig, "DISCORD_WEBHOOK_URLS") || runtimeOrEnv(runtimeConfig, "DISCORD_WEBHOOK_URL")
+    );
+    const NOTIFICATION_TARGETS = [...TELEGRAM_TARGETS, ...DISCORD_TARGETS];
     const SECRET = runtimeOrEnv(runtimeConfig, "WEBHOOK_SECRET");
     const allowedRepos = getAllowedRepos(runtimeOrEnv(runtimeConfig, "ALLOWED_REPOS"));
     const allowedBranch = getAllowedBranch(runtimeOrEnv(runtimeConfig, "ALLOWED_BRANCH"));
@@ -885,7 +990,7 @@ export default async function handler(req, res) {
     const onlyFailures = onlyFailuresEnabled(runtimeOrEnv(runtimeConfig, "ONLY_FAILURES"));
     const silentLowPriority = lowPrioritySilentEnabled(runtimeOrEnv(runtimeConfig, "SILENT_LOW_PRIORITY"));
 
-    if (!BOT_TOKEN || !CHAT_TARGETS.length || !SECRET) {
+    if (!SECRET || !NOTIFICATION_TARGETS.length || (TELEGRAM_TARGETS.length && !BOT_TOKEN)) {
       return res.status(500).json({
         error: "Missing environment variables",
       });
@@ -928,7 +1033,7 @@ export default async function handler(req, res) {
       }
 
       const text = buildStarText(repository, req.body.sender);
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: silentLowPriority,
         disableWebPagePreview: true,
       });
@@ -937,7 +1042,7 @@ export default async function handler(req, res) {
 
     if (event === "fork") {
       const text = buildForkText(repository, req.body.forkee, req.body.sender);
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: silentLowPriority,
         disableWebPagePreview: true,
       });
@@ -946,7 +1051,7 @@ export default async function handler(req, res) {
 
     if (event === "create") {
       const text = buildCreateText(repository, req.body.ref_type, req.body.ref);
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
       });
@@ -955,7 +1060,7 @@ export default async function handler(req, res) {
 
     if (event === "delete") {
       const text = buildDeleteText(repository, req.body.ref_type, req.body.ref);
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
       });
@@ -1006,7 +1111,7 @@ export default async function handler(req, res) {
         text += `\n<a href="${esc(compare)}">View push →</a>`;
       }
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
       });
@@ -1037,7 +1142,7 @@ export default async function handler(req, res) {
 
       const message = formatWorkflowMessage(repository, wf, status);
 
-      for (const chatTarget of CHAT_TARGETS) {
+      for (const chatTarget of NOTIFICATION_TARGETS) {
         await upsertWorkflowNotification(BOT_TOKEN, chatTarget, wf, message);
       }
 
@@ -1062,7 +1167,7 @@ export default async function handler(req, res) {
       const text = buildPullRequestText(repository, pr, action);
       const isRevert = action === "closed" && pr?.merged && isRevertPullRequest(pr);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1086,7 +1191,7 @@ export default async function handler(req, res) {
 
       const text = buildPullRequestReviewText(repository, pr, review, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1108,7 +1213,7 @@ export default async function handler(req, res) {
 
       const text = buildPullRequestReviewCommentText(repository, pr, comment, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1139,7 +1244,7 @@ export default async function handler(req, res) {
 
       const text = buildIssueText(repository, issue, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1165,7 +1270,7 @@ export default async function handler(req, res) {
 
       const text = buildIssueCommentText(repository, issue, comment, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1190,7 +1295,7 @@ export default async function handler(req, res) {
       }
 
       const text = buildDiscussionText(repository, discussion, action);
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1212,7 +1317,7 @@ export default async function handler(req, res) {
 
       const text = buildDiscussionCommentText(repository, discussion, comment, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1237,7 +1342,7 @@ export default async function handler(req, res) {
 
       const text = buildReleaseText(repository, release, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: {
@@ -1263,7 +1368,7 @@ export default async function handler(req, res) {
       const text = buildDeploymentStatusText(repository, deployment, deploymentStatus);
       const targetUrl = deploymentStatus.target_url;
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: targetUrl
@@ -1295,7 +1400,7 @@ export default async function handler(req, res) {
         ? { inline_keyboard: [[{ text: "Open Check", url: checkRun.html_url }]] }
         : null;
 
-      for (const chatTarget of CHAT_TARGETS) {
+      for (const chatTarget of NOTIFICATION_TARGETS) {
         await upsertCheckNotification(BOT_TOKEN, chatTarget, trackingKey, text, currentStatus, currentConclusion, replyMarkup);
       }
 
@@ -1323,7 +1428,7 @@ export default async function handler(req, res) {
         ? { inline_keyboard: [[{ text: "Open Check Suite", url: checkSuite.url }]] }
         : null;
 
-      for (const chatTarget of CHAT_TARGETS) {
+      for (const chatTarget of NOTIFICATION_TARGETS) {
         await upsertCheckNotification(BOT_TOKEN, chatTarget, trackingKey, text, currentStatus, currentConclusion, replyMarkup);
       }
 
@@ -1340,7 +1445,7 @@ export default async function handler(req, res) {
 
       const text = buildBranchProtectionText(repository, rule, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
       });
@@ -1354,7 +1459,7 @@ export default async function handler(req, res) {
 
       const text = buildDependabotText(repository, alert);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: alert.html_url
@@ -1371,7 +1476,7 @@ export default async function handler(req, res) {
 
       const text = buildSecretScanningText(repository, alert);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: alert.html_url
@@ -1388,7 +1493,7 @@ export default async function handler(req, res) {
 
       const text = buildCodeScanningText(repository, alert);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
         replyMarkup: alert.html_url
@@ -1409,7 +1514,7 @@ export default async function handler(req, res) {
 
       const text = buildMemberEventText(event, action, repository, subject);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: true,
         disableWebPagePreview: true,
       });
@@ -1421,7 +1526,7 @@ export default async function handler(req, res) {
       const action = req.body.action || "updated";
       const text = buildGenericOrgEventText("organization_member", action, req.body);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: true,
         disableWebPagePreview: true,
       });
@@ -1442,7 +1547,7 @@ export default async function handler(req, res) {
 
       const text = buildRepoEventText(repository, action);
 
-      await sendToAllChats(BOT_TOKEN, CHAT_TARGETS, text, {
+      await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
         silent: false,
         disableWebPagePreview: true,
       });
