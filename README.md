@@ -222,4 +222,4 @@ Use Redis. Without Redis, deduplication and workflow tracking fall back to proce
 
 ## License
 
-[MIT](https://github.com/abyn365/gitwebhook-notice/LICENSE)
+[MIT](https://github.com/abyn365/gitwebhook-notice/blob/main/LICENSE)
