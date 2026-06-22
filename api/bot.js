@@ -835,17 +835,6 @@ async function handlePendingEdit(chatId, messageId, userId, text, messageFrom = 
 
   if (pending.type === "broadcast") {
     if (pending.step === "draft") {
-      const isReplyToPrompt = Boolean(message?.reply_to_message) && (pending.promptMessageId ? message.reply_to_message?.message_id === pending.promptMessageId : true);
-      if (isGroupChat(message?.chat) && !isReplyToPrompt) {
-        await send(
-          chatId,
-          `✍️ <b>Broadcast draft needs a reply</b>
-
-Please reply to the broadcast prompt message with the text you want to send, then I will show the preview automatically.`,
-          mainMenu()
-        );
-        return true;
-      }
       return handleBroadcastDraft(chatId, messageId, userId, text, messageFrom);
     }
     return false;
@@ -1073,13 +1062,13 @@ function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHand
   };
 }
 async function handleBroadcastMenu(chatId, messageId, userId) {
-  await setPending(userId, chatId, { type: "broadcast", step: "draft", promptMessageId: messageId });
+  await setPending(userId, chatId, { type: "broadcast", step: "draft" });
   await edit(
     chatId,
     messageId,
     `📣 <b>Broadcast composer</b>
 
-A reply prompt is waiting below. Send your announcement text there so I can format it into a clean preview.
+Send your announcement text next and I will format it into a clean preview. You can also reply to the prompt below.
 
 <i>Tip: first line becomes the title. Add a short intro, then bullet lines for highlights. The first URL becomes a button on Telegram and a clickable embed link on Discord.</i>`,
     kb([
@@ -1087,15 +1076,20 @@ A reply prompt is waiting below. Send your announcement text there so I can form
     ])
   );
 
-  await send(
+  const promptResult = await send(
     chatId,
-    `✍️ <b>Reply with your broadcast draft</b>
+    `✍️ <b>Send your broadcast draft</b>
 
-Send the message you want to broadcast as a reply to this prompt.
+Send the message you want to broadcast as your next message, or reply to this prompt.
 
 <i>The first line becomes the title, bullet lines become highlights, and the first URL becomes the link button.</i>`,
     forceReplyMarkup()
   );
+
+  const promptMessageId = promptResult?.ok ? promptResult.result?.message_id : null;
+  if (promptMessageId) {
+    await setPending(userId, chatId, { type: "broadcast", step: "draft", promptMessageId });
+  }
 }
 
 async function handleBroadcastDraft(chatId, messageId, userId, text, messageFrom = {}) {
@@ -1479,7 +1473,7 @@ export default async function handler(req, res) {
               chatId,
               `✍️ <b>Broadcast draft is waiting.</b>
 
-Reply to the broadcast prompt message with your text, or cancel and reopen Broadcast if you need a fresh start.`,
+Send your broadcast text as the next message, reply to the prompt, or cancel and reopen Broadcast if you need a fresh start.`,
               mainMenu()
             );
             return res.status(200).end();
