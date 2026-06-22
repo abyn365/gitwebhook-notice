@@ -1,10 +1,11 @@
 # GitHub → Telegram + Discord Webhook Notifier
 
-A small Vercel app that receives GitHub webhooks and sends useful Telegram notifications. It supports Redis-backed deduplication, GitHub Actions status updates, Telegram groups/topics, and an optional Telegram admin bot for runtime configuration.
+A small Vercel app that receives GitHub webhooks and sends useful Telegram and Discord notifications. It supports Redis-backed deduplication, GitHub Actions status updates, Telegram groups/topics, Discord rich embeds, and an optional Telegram admin bot for runtime configuration.
 
 ## What it does
 
 - Sends GitHub events to one or more Telegram chats and/or Discord webhooks.
+- Renders Discord notifications as rich embeds with color, fields, timestamps, and clickable links.
 - Deduplicates deliveries with Redis when configured.
 - Tracks GitHub Actions workflows and edits the same Telegram message as status changes.
 - Filters by repository, branch, workflow name, failure-only mode, and disabled event types.
