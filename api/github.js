@@ -118,18 +118,42 @@ function decodeHtmlEntities(s) {
     .replace(/&amp;/g, "&");
 }
 
+function normalizeDiscordUrl(url) {
+  const value = String(url ?? "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  if (/^www\./i.test(value)) return `https://${value}`;
+  return value;
+}
+
+function formatDiscordLink(href, label = "") {
+  const url = normalizeDiscordUrl(href);
+  const text = String(label ?? "").trim();
+  if (!url) return text;
+  if (!text || text === url) return `<${url}>`;
+  return `${text} <${url}>`;
+}
+
+function linkifyDiscordUrls(text) {
+  return String(text ?? "").replace(
+    /(?<![<\w])(https?:\/\/[^\s<>()\[\]{}"']+|www\.[^\s<>()\[\]{}"']+)/gi,
+    (match) => `<${normalizeDiscordUrl(match)}>`
+  );
+}
+
 function htmlToDiscordText(html, maxLength = 1900) {
   let text = String(html ?? "");
 
   text = text.replace(/<br\s*\/?>/gi, "\n");
   text = text.replace(/<\/(p|div|li|h[1-6])>/gi, "\n");
   text = text.replace(/<a\s+href="([^"]+)">([\s\S]*?)<\/a>/gi, (_, href, label) => {
-    return `${label} (${href})`;
+    return formatDiscordLink(href, label);
   });
   text = text.replace(/<\/?(b|strong|i|em)>/gi, "");
   text = text.replace(/<code>([\s\S]*?)<\/code>/gi, (_, code) => `\`${code.replace(/`/g, "\\`")}\``);
   text = text.replace(/<[^>]+>/g, "");
   text = decodeHtmlEntities(text);
+  text = linkifyDiscordUrls(text);
   text = text.replace(/\n{3,}/g, "\n\n").trim();
 
   if (text.length > maxLength) {
@@ -145,7 +169,7 @@ function htmlToDiscordMarkdown(html, maxLength = 3900) {
   text = text.replace(/<\s*br\s*\/?>/gi, "\n");
   text = text.replace(/<\/(p|div|li|h[1-6])>/gi, "\n");
   text = text.replace(/<a\s+href="([^"]+)">([\s\S]*?)<\/a>/gi, (_, href, label) => {
-    return `[${label}](${href})`;
+    return formatDiscordLink(href, label);
   });
   text = text.replace(/<(b|strong)>/gi, "**");
   text = text.replace(/<\/(b|strong)>/gi, "**");
@@ -154,6 +178,7 @@ function htmlToDiscordMarkdown(html, maxLength = 3900) {
   text = text.replace(/<code>([\s\S]*?)<\/code>/gi, (_, code) => `\`${code.replace(/`/g, "\\`")}\``);
   text = text.replace(/<[^>]+>/g, "");
   text = decodeHtmlEntities(text);
+  text = linkifyDiscordUrls(text);
   text = text.replace(/\n{3,}/g, "\n\n").trim();
 
   if (text.length > maxLength) {
@@ -229,6 +254,10 @@ function buildDiscordEmbedFromText(text) {
   }
 
   const description = descriptionParts.join("\n").trim();
+  const urlFieldIndex = fields.findIndex((field) => /^(url|link|open|visit|deployment url)$/i.test(field.name));
+  if (urlFieldIndex >= 0) {
+    fields[urlFieldIndex].value = `<${normalizeDiscordUrl(fields[urlFieldIndex].value)}>`;
+  }
   const embed = {
     title,
     color: detectDiscordColor(`${title}\n${description}\n${fields.map((field) => `${field.name}: ${field.value}`).join("\n")}`),
@@ -248,7 +277,7 @@ function buildDiscordEmbedFromText(text) {
   }
 
   if (primaryUrl) {
-    embed.url = primaryUrl;
+    embed.url = normalizeDiscordUrl(primaryUrl);
   }
 
   return embed;
