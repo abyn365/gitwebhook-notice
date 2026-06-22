@@ -896,9 +896,13 @@ function parseTelegramTargets(raw = "") {
     });
 }
 
+function trimBroadcastUrlPunctuation(url = "") {
+  return String(url).trim().replace(/[)\].,!?;:]+$/g, "");
+}
+
 function extractFirstUrl(text = "") {
   const match = String(text).match(/https?:\/\/[^\s<>()\[\]{}"'`]+/i);
-  return match ? match[0] : "";
+  return match ? trimBroadcastUrlPunctuation(match[0]) : "";
 }
 
 function splitBroadcastDraft(text = "") {
@@ -932,29 +936,90 @@ function splitBroadcastDraft(text = "") {
   return { title, body };
 }
 
+function splitBroadcastBody(body = "") {
+  const intro = [];
+  const highlights = [];
+  const lines = String(body ?? "").replace(/\r/g, "").split("\n");
+  let mode = "intro";
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      if (intro.length && intro[intro.length - 1] !== "") intro.push("");
+      continue;
+    }
+
+    if (/^(✨\s*)?(highlights|what'?s new|whats new|details|included|summary)\s*:?$/i.test(line)) {
+      mode = "highlights";
+      continue;
+    }
+
+    if (/^(🔗\s*)?(visit|open link|link|website)\s*:?$/i.test(line)) {
+      continue;
+    }
+
+    const bullet = line.match(/^(?:[•\-*]|(?:\d+\.))\s+(.*)$/);
+    if (bullet) {
+      highlights.push(bullet[1].trim());
+      mode = "highlights";
+      continue;
+    }
+
+    if (mode === "highlights" && highlights.length > 0 && intro.length && intro[intro.length - 1] !== "") {
+      intro.push("");
+    }
+
+    intro.push(line);
+  }
+
+  return {
+    intro: intro.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    highlights,
+  };
+}
+
+function formatBroadcastHighlights(items) {
+
+  return items.map((item) => `• ${item}`).join("\n");
+}
+
 function buildTelegramBroadcastTemplate({ title, body, url, senderName, senderHandle, sourceCount }) {
+  const { intro, highlights } = splitBroadcastBody(body);
   const lines = [];
   lines.push(`📣 <b>${esc(title)}</b>`);
-  lines.push("");
-  lines.push(esc(body));
+
+  if (intro) {
+    lines.push("");
+    lines.push(esc(intro));
+  }
+
+  if (highlights.length) {
+    lines.push("");
+    lines.push(`✨ <b>Highlights</b>`);
+    lines.push(esc(formatBroadcastHighlights(highlights)));
+  }
+
   if (url) {
     lines.push("");
-    lines.push(`🔗 <a href="${esc(url)}">Open link</a>`);
+    lines.push(`🔗 <b>Visit</b>`);
+    lines.push(esc(url));
+    lines.push(`<a href="${esc(url)}">Open link</a>`);
   }
+
   lines.push("");
-  lines.push(`<i>Broadcast by ${esc(senderName)}${senderHandle ? ` (@${esc(senderHandle)})` : ""} • ${esc(sourceCount)} target(s)</i>`);
+  lines.push(`Broadcast by <b>${esc(senderName)}</b>${senderHandle ? ` (@${esc(senderHandle)})` : ""} • ${esc(sourceCount)} target(s)`);
   return lines.join("\n");
 }
 
 function buildTelegramBroadcastButtons(url) {
   if (!url) return null;
-  return { inline_keyboard: [[{ text: "🔗 Open link", url }]] };
+  return { inline_keyboard: [[{ text: "Open link", url }]] };
 }
 
 function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHandle, sourceCount }) {
+  const { intro, highlights } = splitBroadcastBody(body);
   const embed = {
     title: `📣 ${truncateDiscordText(title, 256)}`,
-    description: truncateDiscordText(body, 4096),
     color: 0x5865f2,
     timestamp: new Date().toISOString(),
     footer: { text: `Broadcast • ${sourceCount} target(s)` },
@@ -966,6 +1031,32 @@ function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHand
 
   if (url) {
     embed.url = url;
+  }
+
+  const descriptionParts = [];
+  if (intro) descriptionParts.push(intro);
+  if (url) descriptionParts.push(`🔗 Visit\n${url}`);
+  if (descriptionParts.length) {
+    embed.description = truncateDiscordText(descriptionParts.join("\n\n"), 4096);
+  }
+
+  const fields = [];
+  if (highlights.length) {
+    fields.push({
+      name: "✨ Highlights",
+      value: truncateDiscordText(formatBroadcastHighlights(highlights), 1024),
+      inline: false,
+    });
+  }
+  if (url) {
+    fields.push({
+      name: "🔗 Open link",
+      value: truncateDiscordText(url, 1024),
+      inline: false,
+    });
+  }
+  if (fields.length) {
+    embed.fields = fields;
   }
 
   return {
@@ -994,7 +1085,7 @@ async function handleBroadcastMenu(chatId, messageId, userId) {
 
 Send the message you want to send to every configured target.
 
-<i>Tip: use a title on the first line, then add the body below. The first URL will become a button and a Discord embed link.</i>`;
+<i>Tip: first line becomes the title. Add a short intro, then bullet lines for a clean highlights section. The first URL becomes a button on Telegram and a clickable embed link on Discord.</i>`;
   await edit(
     chatId,
     messageId,
@@ -1014,6 +1105,7 @@ async function handleBroadcastDraft(chatId, messageId, userId, text, messageFrom
   const senderName = [messageFrom.first_name, messageFrom.last_name].filter(Boolean).join(" ").trim() || "Admin";
   const senderHandle = messageFrom.username || "";
   const { allTargets, telegramTargets, discordTargets } = await getNotificationTargets();
+
   if (!allTargets.length) {
     await clearPending(userId, chatId);
     await send(chatId, "⚠️ No CHAT_ID or DISCORD_WEBHOOK_URLS configured — nowhere to broadcast.", mainMenu());
