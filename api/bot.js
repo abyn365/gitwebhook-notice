@@ -936,6 +936,11 @@ function splitBroadcastDraft(text = "") {
   return { title, body };
 }
 
+function isStandaloneUrlLine(line = "") {
+  const v = String(line ?? "").trim();
+  return /^https?:\/\//i.test(v) && !/\s/.test(v);
+}
+
 function splitBroadcastBody(body = "") {
   const intro = [];
   const highlights = [];
@@ -958,6 +963,10 @@ function splitBroadcastBody(body = "") {
       continue;
     }
 
+    if (isStandaloneUrlLine(line)) {
+      continue;
+    }
+
     const bullet = line.match(/^(?:[•\-*]|(?:\d+\.))\s+(.*)$/);
     if (bullet) {
       highlights.push(bullet[1].trim());
@@ -977,7 +986,6 @@ function splitBroadcastBody(body = "") {
     highlights,
   };
 }
-
 function formatBroadcastHighlights(items) {
 
   return items.map((item) => `• ${item}`).join("\n");
@@ -986,7 +994,7 @@ function formatBroadcastHighlights(items) {
 function buildTelegramBroadcastTemplate({ title, body, url, senderName, senderHandle, sourceCount }) {
   const { intro, highlights } = splitBroadcastBody(body);
   const lines = [];
-  lines.push(`📣 <b>${esc(title)}</b>`);
+  lines.push(`<b>${esc(title)}</b>`);
 
   if (intro) {
     lines.push("");
@@ -1003,14 +1011,12 @@ function buildTelegramBroadcastTemplate({ title, body, url, senderName, senderHa
     lines.push("");
     lines.push(`🔗 <b>Visit</b>`);
     lines.push(esc(url));
-    lines.push(`<a href="${esc(url)}">Open link</a>`);
   }
 
   lines.push("");
   lines.push(`Broadcast by <b>${esc(senderName)}</b>${senderHandle ? ` (@${esc(senderHandle)})` : ""} • ${esc(sourceCount)} target(s)`);
   return lines.join("\n");
 }
-
 function buildTelegramBroadcastButtons(url) {
   if (!url) return null;
   return { inline_keyboard: [[{ text: "Open link", url }]] };
@@ -1019,7 +1025,7 @@ function buildTelegramBroadcastButtons(url) {
 function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHandle, sourceCount }) {
   const { intro, highlights } = splitBroadcastBody(body);
   const embed = {
-    title: `📣 ${truncateDiscordText(title, 256)}`,
+    title: truncateDiscordText(title, 256),
     color: 0x5865f2,
     timestamp: new Date().toISOString(),
     footer: { text: `Broadcast • ${sourceCount} target(s)` },
@@ -1035,50 +1041,22 @@ function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHand
 
   const descriptionParts = [];
   if (intro) descriptionParts.push(intro);
-  if (url) descriptionParts.push(`🔗 Visit\n${url}`);
-  if (descriptionParts.length) {
-    embed.description = truncateDiscordText(descriptionParts.join("\n\n"), 4096);
-  }
-
-  const fields = [];
   if (highlights.length) {
-    fields.push({
-      name: "✨ Highlights",
-      value: truncateDiscordText(formatBroadcastHighlights(highlights), 1024),
-      inline: false,
-    });
+    descriptionParts.push(`✨ Highlights\n${formatBroadcastHighlights(highlights)}`);
   }
   if (url) {
-    fields.push({
-      name: "🔗 Open link",
-      value: truncateDiscordText(url, 1024),
-      inline: false,
-    });
+    descriptionParts.push(`🔗 Visit\n${url}`);
   }
-  if (fields.length) {
-    embed.fields = fields;
+  if (descriptionParts.length) {
+    embed.description = truncateDiscordText(descriptionParts.join("\n\n"), 4096);
   }
 
   return {
     embeds: [embed],
     username: "GitHub Bot",
     avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
-    allowed_mentions: { parse: [] },
   };
 }
-
-async function getNotificationTargets() {
-  const chatRaw = await getEffectiveConfig("CHAT_ID");
-  const discordRaw = (await getEffectiveConfig("DISCORD_WEBHOOK_URLS")) || (await getEffectiveConfig("DISCORD_WEBHOOK_URL"));
-  const telegramTargets = parseTelegramTargets(chatRaw);
-  const discordTargets = parseDiscordWebhookTargets(discordRaw);
-  return {
-    telegramTargets,
-    discordTargets,
-    allTargets: [...telegramTargets, ...discordTargets],
-  };
-}
-
 async function handleBroadcastMenu(chatId, messageId, userId) {
   await setPending(userId, chatId, { type: "broadcast", step: "draft", promptMessageId: messageId });
   const text = `📣 <b>Broadcast</b>
