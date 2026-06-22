@@ -140,7 +140,8 @@ function formatDiscordLink(href, label = "") {
   const text = String(label ?? "").trim();
   if (!url) return text;
   if (!text || text === url) return `<${url}>`;
-  return `${text} (<${url}>)`;
+  const safeLabel = escapeDiscordLinkLabel(text);
+  return `[${safeLabel}](${url})`;
 }
 
 function linkifyDiscordUrls(text) {
