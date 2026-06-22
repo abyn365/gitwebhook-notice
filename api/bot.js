@@ -1023,7 +1023,30 @@ function buildTelegramBroadcastTemplate({ title, body, url, senderName, senderHa
 }
 function buildTelegramBroadcastButtons(url) {
   if (!url) return null;
-  return { inline_keyboard: [[{ text: "Open link", url }]] };
+  return { reply_markup: { inline_keyboard: [[{ text: "Open link", url }]] } };
+}
+
+async function getNotificationTargets() {
+  const cfg = await getEffectiveConfigValues(["CHAT_ID", "DISCORD_WEBHOOK_URLS"]);
+  const telegramTargets = parseTelegramTargets(cfg.CHAT_ID || "");
+  const discordTargets = parseDiscordWebhookTargets(cfg.DISCORD_WEBHOOK_URLS || "");
+
+  const seen = new Set();
+  const dedupe = (targets) => targets.filter((target) => {
+    const key = target.provider === "discord"
+      ? `discord:${target.url}`
+      : `telegram:${target.chatId}:${target.threadId || ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const allTargets = dedupe([...telegramTargets, ...discordTargets]);
+  return {
+    telegramTargets: allTargets.filter((target) => target.provider === "telegram"),
+    discordTargets: allTargets.filter((target) => target.provider === "discord"),
+    allTargets,
+  };
 }
 
 function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHandle, sourceCount }) {
@@ -1066,11 +1089,9 @@ async function handleBroadcastMenu(chatId, messageId, userId) {
   await edit(
     chatId,
     messageId,
-    `📣 <b>Broadcast composer</b>
+    `📣 <b>Broadcast composer opened</b>
 
-Send your announcement text next and I will format it into a clean preview. You can also reply to the prompt below.
-
-<i>Tip: first line becomes the title. Add a short intro, then bullet lines for highlights. The first URL becomes a button on Telegram and a clickable embed link on Discord.</i>`,
+Reply to the prompt below with your announcement text. This keeps the menu from duplicating the full composer instructions.`,
     kb([
       [{ text: "← Back", callback_data: "home" }],
     ])
@@ -1177,8 +1198,8 @@ async function handleBroadcastSend(chatId, messageId, userId) {
         await sendDiscordWebhook(target.url, discordPayload);
       } else {
         await send(target.chatId, telegramText, {
-          reply_markup: telegramMarkup || undefined,
           disable_web_page_preview: false,
+          ...(telegramMarkup || {}),
           ...(target.threadId ? { message_thread_id: target.threadId } : {}),
         });
       }
@@ -1249,7 +1270,8 @@ async function sendDiscordWebhook(url, payload) {
     signal: AbortSignal.timeout(8_000),
   });
 
-  const data = await response.json();
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
   if (!response.ok) {
     throw new Error(`Discord webhook failed: ${response.status} ${JSON.stringify(data)}`);
   }
