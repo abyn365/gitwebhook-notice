@@ -905,7 +905,6 @@ function buildDiscordTestPayload() {
   };
 
   return {
-    content: truncateDiscordText("✅ GitHub webhook test: Discord embed delivery is working.", 1800),
     embeds: [embed],
     allowed_mentions: { parse: [] },
     username: "GitHub Bot",
