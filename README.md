@@ -1,4 +1,4 @@
-# GitHub Webhook Notifier
+# GitHub → Telegram + Discord Webhook Notifier
 
 A small Vercel app that receives GitHub webhooks and sends useful Telegram and Discord notifications. It supports Redis-backed deduplication, GitHub Actions status updates, Telegram groups/topics, Discord rich embeds, and an optional Telegram admin bot for runtime configuration.
 
@@ -10,7 +10,7 @@ A small Vercel app that receives GitHub webhooks and sends useful Telegram and D
 - Tracks GitHub Actions workflows and edits the same Telegram message as status changes.
 - Filters by repository, branch, workflow name, failure-only mode, and disabled event types.
 - Supports Telegram supergroups and forum topics through `CHAT_ID` entries.
-- Includes an admin bot at `/api/bot` for status, testing, and editing runtime config.
+- Includes an admin bot at `/api/bot` for status, testing, broadcasting, and editing runtime config.
 
 ## Project structure
 
@@ -166,7 +166,8 @@ Admin commands:
 
 - `/start` or `/login` — authenticate.
 - `/menu` or `/help` — open the dashboard.
-- `/cancel` — cancel a pending edit.
+- `/broadcast` — start a broadcast with a preview template and send confirmation.
+- `/cancel` — cancel a pending edit or broadcast.
 
 In groups, use `/start <dashboard-password>` or `/login <dashboard-password>`. Plain password messages are ignored in groups so the bot does not react to normal chat messages.
 
@@ -222,4 +223,4 @@ Use Redis. Without Redis, deduplication and workflow tracking fall back to proce
 
 ## License
 
-[MIT](https://github.com/abyn365/gitwebhook-notice/blob/main/LICENSE)
+MIT
