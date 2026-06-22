@@ -1,8 +1,10 @@
 {
-  "name": "github-telegram-webhook",
+  "name": "github-telegram-discord-webhook",
   "type": "module",
   "dependencies": {
-    "node-fetch": "^3.3.2",
     "redis": "^4.7.0"
+  },
+  "scripts": {
+    "check": "node --check api/github.js && node --check api/bot.js"
   }
 }
