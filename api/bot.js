@@ -1443,6 +1443,23 @@ export default async function handler(req, res) {
           await send(chatId, authPromptText(groupChat));
           return res.status(200).end();
         }
+
+        const pendingBroadcast = await getPending(userId, chatId);
+        if (pendingBroadcast && pendingBroadcast.type === "broadcast") {
+          if (pendingBroadcast.step === "confirm") {
+            await handleBroadcastSend(chatId, msg.message_id, userId);
+            return res.status(200).end();
+          }
+          if (pendingBroadcast.step === "draft") {
+            await send(
+              chatId,
+              "📣 <b>Broadcast draft is waiting.</b>\n\nSend the broadcast text first, then press the <b>Send broadcast</b> button or use /broadcast again after the preview appears.",
+              mainMenu()
+            );
+            return res.status(200).end();
+          }
+        }
+
         await handleBroadcastMenu(chatId, msg.message_id, userId);
         return res.status(200).end();
       }
