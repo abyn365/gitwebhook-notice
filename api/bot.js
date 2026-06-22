@@ -880,14 +880,44 @@ function parseDiscordWebhookTargets(raw = "") {
     }));
 }
 
-async function sendDiscordWebhook(url, content) {
+function truncateDiscordText(text, maxLength) {
+  const value = String(text ?? "");
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function buildDiscordTestPayload() {
+  const embed = {
+    title: "✅ Discord integration ready",
+    description: "GitHub notifications are being delivered as embeds.",
+    color: 0x2ecc71,
+    fields: [
+      { name: "Format", value: "Rich Discord embed", inline: true },
+      { name: "Mention protection", value: "Enabled", inline: true },
+      { name: "Result", value: "Webhook delivery works", inline: false },
+    ],
+    footer: { text: "GitHub webhook test" },
+    timestamp: new Date().toISOString(),
+    author: {
+      name: "GitHub",
+      icon_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+    },
+  };
+
+  return {
+    content: truncateDiscordText("✅ GitHub webhook test: Discord embed delivery is working.", 1800),
+    embeds: [embed],
+    allowed_mentions: { parse: [] },
+    username: "GitHub Bot",
+    avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+  };
+}
+
+async function sendDiscordWebhook(url, payload) {
   const response = await fetch(`${url}?wait=true`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      content,
-      allowed_mentions: { parse: [] },
-    }),
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(8_000),
   });
 
@@ -928,7 +958,7 @@ async function handleTest(chatId, messageId) {
   await edit(chatId, messageId, `📨 Sending test message to ${totalTargets} target(s)…`, backMenu("home"));
 
   const telegramMsg = `🧪 <b>gh-notify test message</b>\n\nIf you see this, your Telegram integration is working correctly.\n\n<i>Sent from admin bot</i>`;
-  const discordMsg = `🧪 gh-notify test message\n\nIf you see this, your Discord integration is working correctly.\n\nSent from admin bot`;
+  const discordMsg = buildDiscordTestPayload();
   let ok = 0, fail = 0;
 
   for (const target of telegramTargets) {
