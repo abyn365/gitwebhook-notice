@@ -18,6 +18,7 @@
  *   VERCEL_TOKEN       — Vercel API token
  *   VERCEL_PROJECT_ID  — Vercel project ID
  *   VERCEL_TEAM_ID     — Vercel team ID (if applicable)
+ *   DISCORD_WEBHOOK_URLS — optional Discord webhook(s) to test from the dashboard
  *
  * Optional (for activity log):
  *   REDIS_URL / UPSTASH_REDIS_URL — same as github.js
@@ -47,12 +48,12 @@ const ALL_EVENTS = [
 ];
 
 const EDITABLE_KEYS = [
-  "BOT_TOKEN", "BOT_USERNAME", "CHAT_ID", "WEBHOOK_SECRET", "REDIS_URL",
+  "BOT_TOKEN", "BOT_USERNAME", "CHAT_ID", "DISCORD_WEBHOOK_URLS", "WEBHOOK_SECRET", "REDIS_URL",
   "ALLOWED_REPOS", "ALLOWED_BRANCH", "WORKFLOW_NAME_FILTER",
   "ONLY_FAILURES", "SILENT_LOW_PRIORITY", "DISABLED_EVENTS",
 ];
 
-const SENSITIVE = new Set(["BOT_TOKEN", "WEBHOOK_SECRET", "REDIS_URL"]);
+const SENSITIVE = new Set(["BOT_TOKEN", "WEBHOOK_SECRET", "REDIS_URL", "DISCORD_WEBHOOK_URLS"]);
 
 // ─── env helpers ─────────────────────────────────────────────────────────────
 
@@ -503,6 +504,7 @@ async function configSummary() {
     "BOT_TOKEN",
     "BOT_USERNAME",
     "CHAT_ID",
+    "DISCORD_WEBHOOK_URLS",
     "WEBHOOK_SECRET",
     "REDIS_URL",
     "ALLOWED_REPOS",
@@ -515,6 +517,8 @@ async function configSummary() {
   const botUsername = (cfg.BOT_USERNAME || "").trim().replace(/^@/, "");
   const chatRaw  = cfg.CHAT_ID || "";
   const chats    = chatRaw.split(",").map(s => s.trim()).filter(Boolean);
+  const discordRaw = cfg.DISCORD_WEBHOOK_URLS || "";
+  const discordTargets = discordRaw.split(",").map(s => s.trim()).filter(Boolean);
   const repos    = cfg.ALLOWED_REPOS || "—";
   const branch   = cfg.ALLOWED_BRANCH || "—";
   const wfFilter = cfg.WORKFLOW_NAME_FILTER || "—";
@@ -528,6 +532,7 @@ async function configSummary() {
 ${dot(!!cfg.BOT_TOKEN)} <b>BOT_TOKEN</b>: ${cfg.BOT_TOKEN ? "configured" : "missing"}
 ${dot(!!botUsername)} <b>BOT_USERNAME</b>: ${botUsername ? `<code>${esc(botUsername)}</code>` : "recommended for groups"}
 ${dot(chats.length > 0)} <b>CHAT_ID</b>: ${chats.length ? chats.map(c => `<code>${esc(c)}</code>`).join(", ") : "missing"}
+${dot(discordTargets.length > 0)} <b>DISCORD_WEBHOOK_URLS</b>: ${discordTargets.length ? `${discordTargets.length} webhook(s) configured` : "missing"}
 ${dot(!!cfg.WEBHOOK_SECRET)} <b>WEBHOOK_SECRET</b>: ${cfg.WEBHOOK_SECRET ? "configured" : "missing"}
 ${dot(hasRedis)} <b>Redis</b>: ${hasRedis ? "connected" : "in-memory fallback"}
 
@@ -546,6 +551,7 @@ function statusSummary(botInfo, webhookInfo, stats = {}) {
   const env = {
     hasBot:    !!process.env.BOT_TOKEN,
     hasChatId: !!(process.env.CHAT_ID || "").trim(),
+    hasDiscord: !!(process.env.DISCORD_WEBHOOK_URLS || "").trim(),
     hasSecret: !!process.env.WEBHOOK_SECRET,
     hasRedis:  !!(process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL || process.env.webhook_REDIS_URL),
     hasVercel: hasVercelConfig(),
@@ -562,6 +568,7 @@ function statusSummary(botInfo, webhookInfo, stats = {}) {
 
   out += `${dot(env.hasBot)}    BOT_TOKEN\n`;
   out += `${dot(env.hasChatId)} CHAT_ID\n`;
+  out += `${dot(env.hasDiscord)} DISCORD_WEBHOOK_URLS\n`;
   out += `${dot(env.hasSecret)} WEBHOOK_SECRET\n`;
   out += `${dot(env.hasRedis)}  Redis\n`;
   out += `${dot(env.hasVercel)} Vercel API (optional config mirror)\n`;
@@ -860,24 +867,42 @@ Send <code>-</code> again to confirm, or send /cancel to abort.`,
   return true;
 }
 
+
+function parseDiscordWebhookTargets(raw = "") {
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((url) => ({
+      provider: "discord",
+      chatId: `discord:${url}`,
+      url,
+    }));
+}
+
+async function sendDiscordWebhook(url, content) {
+  const response = await fetch(`${url}?wait=true`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      content,
+      allowed_mentions: { parse: [] },
+    }),
+    signal: AbortSignal.timeout(8_000),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Discord webhook failed: ${response.status} ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
 async function handleTest(chatId, messageId) {
   const chatRaw = await getEffectiveConfig("CHAT_ID");
-  const targets = chatRaw.split(",").map(s => s.trim()).filter(Boolean);
+  const discordRaw = (await getEffectiveConfig("DISCORD_WEBHOOK_URLS")) || (await getEffectiveConfig("DISCORD_WEBHOOK_URL"));
 
-  if (!targets.length) {
-    await edit(chatId, messageId,
-      "⚠️ No CHAT_ID configured — nowhere to send the test message.",
-      backMenu("home")
-    );
-    return;
-  }
-
-  await edit(chatId, messageId, `📨 Sending test message to ${targets.length} chat(s)…`, backMenu("home"));
-
-  const msg = `🧪 <b>gh-notify test message</b>\n\nIf you see this, your Telegram integration is working correctly.\n\n<i>Sent from admin bot</i>`;
-  let ok = 0, fail = 0;
-
-  for (const entry of targets) {
+  const telegramTargets = chatRaw.split(",").map(s => s.trim()).filter(Boolean).map((entry) => {
     const colonIdx = entry.lastIndexOf(":");
     let targetChatId = entry, threadId = null;
     if (colonIdx > 1) {
@@ -887,9 +912,29 @@ async function handleTest(chatId, messageId) {
         threadId = tid;
       }
     }
+    return { chatId: targetChatId, threadId };
+  });
+  const discordTargets = parseDiscordWebhookTargets(discordRaw);
+  const totalTargets = telegramTargets.length + discordTargets.length;
+
+  if (!totalTargets) {
+    await edit(chatId, messageId,
+      "⚠️ No CHAT_ID or DISCORD_WEBHOOK_URLS configured — nowhere to send the test message.",
+      backMenu("home")
+    );
+    return;
+  }
+
+  await edit(chatId, messageId, `📨 Sending test message to ${totalTargets} target(s)…`, backMenu("home"));
+
+  const telegramMsg = `🧪 <b>gh-notify test message</b>\n\nIf you see this, your Telegram integration is working correctly.\n\n<i>Sent from admin bot</i>`;
+  const discordMsg = `🧪 gh-notify test message\n\nIf you see this, your Discord integration is working correctly.\n\nSent from admin bot`;
+  let ok = 0, fail = 0;
+
+  for (const target of telegramTargets) {
     try {
-      const payload = { chat_id: targetChatId, text: msg, parse_mode: "HTML", disable_web_page_preview: true };
-      if (threadId) payload.message_thread_id = threadId;
+      const payload = { chat_id: target.chatId, text: telegramMsg, parse_mode: "HTML", disable_web_page_preview: true };
+      if (target.threadId) payload.message_thread_id = target.threadId;
       const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN()}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -904,9 +949,19 @@ async function handleTest(chatId, messageId) {
     }
   }
 
+  for (const target of discordTargets) {
+    try {
+      await sendDiscordWebhook(target.url, discordMsg);
+      ok++;
+    } catch (e) {
+      fail++;
+      console.error("Discord test send error:", e);
+    }
+  }
+
   const result = fail === 0
-    ? `✅ Test message delivered to all ${ok} chat(s).`
-    : `⚠️ Delivered to ${ok}/${targets.length} chats. ${fail} failed — check logs.`;
+    ? `✅ Test message delivered to all ${ok} target(s).`
+    : `⚠️ Delivered to ${ok}/${totalTargets} targets. ${fail} failed — check logs.`;
 
   await send(chatId, result, mainMenu());
 }
