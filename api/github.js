@@ -139,14 +139,17 @@ function formatDiscordLink(href, label = "") {
   const url = normalizeDiscordUrl(href);
   const text = String(label ?? "").trim();
   if (!url) return text;
-  if (!text) return url;
-  return `[${escapeDiscordLinkLabel(text)}](${url})`;
+  if (!text || text === url) return `<${url}>`;
+  return `${text} (<${url}>)`;
 }
 
 function linkifyDiscordUrls(text) {
   return String(text ?? "").replace(
     /(?<![<\w])(https?:\/\/[^\s<>()\[\]{}"']+|www\.[^\s<>()\[\]{}"']+)/gi,
-    (match) => normalizeDiscordUrl(match)
+    (match) => {
+      const url = normalizeDiscordUrl(match);
+      return url ? `<${url}>` : match;
+    }
   );
 }
 
@@ -289,15 +292,14 @@ function normalizeDiscordFieldValue(name, value, primaryUrl = "") {
   const markdown = raw.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/i);
   if (markdown) {
     const normalized = normalizeDiscordUrl(markdown[2]);
-    if (urlish && normalized) return `<${normalized}>`;
-    return formatDiscordLink(markdown[2], markdown[1]);
+    if (normalized) return `<${normalized}>`;
   }
 
   const bareUrl = raw.match(/^(https?:\/\/[^\s<>()\[\]{}]+|www\.[^\s<>()\[\]{}]+)$/i);
   if (bareUrl) {
     const normalized = normalizeDiscordUrl(bareUrl[1]);
     if (urlish && normalized) return `<${normalized}>`;
-    return normalized;
+    return `<${normalized}>`;
   }
 
   if (urlish) {
@@ -343,12 +345,12 @@ function buildDiscordEmbedFromText(text) {
     }))
     .filter((field) => field.value);
 
-  const urlFieldIndex = normalizedFields.findIndex((field) => /^(url|link|open|visit|deployment url)$/i.test(field.name));
+  const urlFieldIndex = normalizedFields.findIndex((field) => /^(url|link|open|visit|deployment url|target url|homepage|home page|website|preview|preview url|release url|artifact url)$/i.test(field.name));
   if (urlFieldIndex >= 0) {
     const field = normalizedFields[urlFieldIndex];
     const normalized = normalizeDiscordUrl(extractPrimaryDiscordUrl(field.value) || primaryUrl);
     if (normalized) {
-      field.value = normalized;
+      field.value = `<${normalized}>`;
     } else {
       normalizedFields.splice(urlFieldIndex, 1);
     }
