@@ -139,18 +139,14 @@ function formatDiscordLink(href, label = "") {
   const url = normalizeDiscordUrl(href);
   const text = String(label ?? "").trim();
   if (!url) return text;
-  if (!text || text === url) return `<${url}>`;
-  const safeLabel = escapeDiscordLinkLabel(text);
-  return `[${safeLabel}](${url})`;
+  if (!text) return url;
+  return `[${escapeDiscordLinkLabel(text)}](${url})`;
 }
 
 function linkifyDiscordUrls(text) {
   return String(text ?? "").replace(
     /(?<![<\w])(https?:\/\/[^\s<>()\[\]{}"']+|www\.[^\s<>()\[\]{}"']+)/gi,
-    (match) => {
-      const url = normalizeDiscordUrl(match);
-      return url ? `<${url}>` : match;
-    }
+    (match) => normalizeDiscordUrl(match)
   );
 }
 
@@ -216,13 +212,20 @@ function truncateDiscordText(text, maxLength) {
   return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
+function stripDiscordFieldMarkers(line) {
+  let normalized = String(line ?? "").trim();
+  normalized = normalized.replace(/^(?:\*\*|__|\*|_)+/, "");
+  normalized = normalized.replace(/(?:\*\*|__|\*|_)+(?=\s|$)/, "");
+  return normalized.trim();
+}
+
 function isDiscordFieldLine(line) {
-  const normalized = String(line ?? "").replace(/^\*\*|\*\*$/g, "");
+  const normalized = stripDiscordFieldMarkers(line);
   return /^[A-Za-z0-9][A-Za-z0-9 _/().-]{0,40}:\s+/.test(normalized);
 }
 
 function splitDiscordFieldLine(line) {
-  const normalized = String(line ?? "").replace(/^\*\*|\*\*$/g, "");
+  const normalized = stripDiscordFieldMarkers(line);
   const match = normalized.match(/^([A-Za-z0-9][A-Za-z0-9 _/().-]{0,40}):(\s+)([\s\S]*)$/);
   if (!match) return null;
   return {
@@ -250,7 +253,7 @@ function extractPrimaryDiscordUrl(html) {
   for (const match of source.matchAll(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi)) {
     urls.push(match[1]);
   }
-  for (const match of source.matchAll(/https?:\/\/[^\s<>()\[\]{}]+/gi)) {
+  for (const match of source.matchAll(/https?:\/\/[^\s<>()\[\]{}"'`]+/gi)) {
     urls.push(match[0]);
   }
 
@@ -258,55 +261,33 @@ function extractPrimaryDiscordUrl(html) {
   return normalizeDiscordUrl(urls[urls.length - 1]);
 }
 
-function isDiscordUrlFieldName(name) {
-  const label = String(name ?? "").trim().toLowerCase();
-  return [
-    "url",
-    "link",
-    "open",
-    "visit",
-    "deployment url",
-    "target url",
-    "homepage",
-    "home page",
-    "website",
-    "preview",
-    "preview url",
-    "release url",
-    "artifact url",
-  ].includes(label);
-}
-
 function normalizeDiscordFieldValue(name, value, primaryUrl = "") {
   const label = String(name ?? "").trim();
   const raw = String(value ?? "").trim();
-  const urlish = isDiscordUrlFieldName(label);
+  const urlish = /^(url|link|open|visit|deployment url)$/i.test(label);
 
   if (!raw) {
     if (urlish) {
       const fallback = normalizeDiscordUrl(primaryUrl);
-      return fallback ? `<${fallback}>` : "";
+      return fallback || "";
     }
     return "";
   }
 
   const markdown = raw.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/i);
   if (markdown) {
-    const normalized = normalizeDiscordUrl(markdown[2]);
-    if (normalized) return `<${normalized}>`;
+    return urlish ? normalizeDiscordUrl(markdown[2]) : formatDiscordLink(markdown[2], markdown[1]);
   }
 
   const bareUrl = raw.match(/^(https?:\/\/[^\s<>()\[\]{}]+|www\.[^\s<>()\[\]{}]+)$/i);
   if (bareUrl) {
-    const normalized = normalizeDiscordUrl(bareUrl[1]);
-    if (urlish && normalized) return `<${normalized}>`;
-    return `<${normalized}>`;
+    return normalizeDiscordUrl(bareUrl[1]);
   }
 
   if (urlish) {
     const extracted = extractPrimaryDiscordUrl(raw) || primaryUrl;
     const normalized = normalizeDiscordUrl(extracted);
-    if (normalized) return `<${normalized}>`;
+    if (normalized) return normalized;
   }
 
   return raw;
@@ -346,12 +327,12 @@ function buildDiscordEmbedFromText(text) {
     }))
     .filter((field) => field.value);
 
-  const urlFieldIndex = normalizedFields.findIndex((field) => /^(url|link|open|visit|deployment url|target url|homepage|home page|website|preview|preview url|release url|artifact url)$/i.test(field.name));
+  const urlFieldIndex = normalizedFields.findIndex((field) => /^(url|link|open|visit|deployment url)$/i.test(field.name));
   if (urlFieldIndex >= 0) {
     const field = normalizedFields[urlFieldIndex];
-    const normalized = normalizeDiscordUrl(extractPrimaryDiscordUrl(field.value) || primaryUrl);
+    const normalized = normalizeDiscordUrl(extractPrimaryDiscordUrl(field.value) || primaryUrl || field.value);
     if (normalized) {
-      field.value = `<${normalized}>`;
+      field.value = normalized;
     } else {
       normalizedFields.splice(urlFieldIndex, 1);
     }
