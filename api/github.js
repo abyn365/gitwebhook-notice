@@ -891,10 +891,8 @@ function buildTelegramPayload(chatId, text, { silent = false, replyMarkup = null
 
 function buildDiscordPayload(text, options = {}) {
   const embed = buildDiscordEmbedFromText(text);
-  const content = htmlToDiscordText(text, 1800);
 
   return {
-    content,
     embeds: [embed],
     username: options.username || "GitHub Bot",
     avatar_url: options.avatarUrl || "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
