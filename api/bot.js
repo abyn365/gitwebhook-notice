@@ -423,6 +423,10 @@ function kb(rows) {
   return { reply_markup: { inline_keyboard: rows } };
 }
 
+function forceReplyMarkup() {
+  return { reply_markup: { force_reply: true, selective: true } };
+}
+
 // ─── Vercel API ───────────────────────────────────────────────────────────────
 
 function vercelEnvsUrl() {
@@ -818,7 +822,7 @@ async function handleToggle(chatId, messageId, callbackId, key) {
   await handleEditMenu(chatId, messageId);
 }
 
-async function handlePendingEdit(chatId, messageId, userId, text, messageFrom = {}) {
+async function handlePendingEdit(chatId, messageId, userId, text, messageFrom = {}, message = null) {
   const pending = await getPending(userId, chatId);
   if (!pending) return false; // not in edit mode
 
@@ -831,6 +835,17 @@ async function handlePendingEdit(chatId, messageId, userId, text, messageFrom = 
 
   if (pending.type === "broadcast") {
     if (pending.step === "draft") {
+      const isReplyToPrompt = Boolean(message?.reply_to_message) && (pending.promptMessageId ? message.reply_to_message?.message_id === pending.promptMessageId : true);
+      if (isGroupChat(message?.chat) && !isReplyToPrompt) {
+        await send(
+          chatId,
+          `✍️ <b>Broadcast draft needs a reply</b>
+
+Please reply to the broadcast prompt message with the text you want to send, then I will show the preview automatically.`,
+          mainMenu()
+        );
+        return true;
+      }
       return handleBroadcastDraft(chatId, messageId, userId, text, messageFrom);
     }
     return false;
@@ -1059,18 +1074,27 @@ function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHand
 }
 async function handleBroadcastMenu(chatId, messageId, userId) {
   await setPending(userId, chatId, { type: "broadcast", step: "draft", promptMessageId: messageId });
-  const text = `📣 <b>Broadcast</b>
-
-Send the message you want to send to every configured target.
-
-<i>Tip: first line becomes the title. Add a short intro, then bullet lines for a clean highlights section. The first URL becomes a button on Telegram and a clickable embed link on Discord.</i>`;
   await edit(
     chatId,
     messageId,
-    text,
+    `📣 <b>Broadcast composer</b>
+
+A reply prompt is waiting below. Send your announcement text there so I can format it into a clean preview.
+
+<i>Tip: first line becomes the title. Add a short intro, then bullet lines for highlights. The first URL becomes a button on Telegram and a clickable embed link on Discord.</i>`,
     kb([
       [{ text: "← Back", callback_data: "home" }],
     ])
+  );
+
+  await send(
+    chatId,
+    `✍️ <b>Reply with your broadcast draft</b>
+
+Send the message you want to broadcast as a reply to this prompt.
+
+<i>The first line becomes the title, bullet lines become highlights, and the first URL becomes the link button.</i>`,
+    forceReplyMarkup()
   );
 }
 
@@ -1401,7 +1425,7 @@ export default async function handler(req, res) {
       // is allowed to consume the user's next message as the new value.
       if (groupChat && !directCommand) {
         if (await isAuthenticated(userId)) {
-          const handled = await handlePendingEdit(chatId, msg.message_id, userId, text, msg.from);
+          const handled = await handlePendingEdit(chatId, msg.message_id, userId, text, msg.from, msg);
           if (handled) return res.status(200).end();
         }
         return res.status(200).end();
@@ -1453,7 +1477,9 @@ export default async function handler(req, res) {
           if (pendingBroadcast.step === "draft") {
             await send(
               chatId,
-              "📣 <b>Broadcast draft is waiting.</b>\n\nSend the broadcast text first, then press the <b>Send broadcast</b> button or use /broadcast again after the preview appears.",
+              `✍️ <b>Broadcast draft is waiting.</b>
+
+Reply to the broadcast prompt message with your text, or cancel and reopen Broadcast if you need a fresh start.`,
               mainMenu()
             );
             return res.status(200).end();
