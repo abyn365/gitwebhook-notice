@@ -1,5 +1,5 @@
 {
-  "name": "gitwebhook",
+  "name": "gitwebhook-notice",
   "type": "module",
   "dependencies": {
     "redis": "^4.7.0"
