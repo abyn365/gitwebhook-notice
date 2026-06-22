@@ -141,6 +141,13 @@ function linkifyDiscordUrls(text) {
   );
 }
 
+function replaceMarkdownLinksWithDiscord(text) {
+  return String(text ?? "").replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi,
+    (_, label, href) => formatDiscordLink(href, label)
+  );
+}
+
 function htmlToDiscordText(html, maxLength = 1900) {
   let text = String(html ?? "");
 
@@ -153,6 +160,7 @@ function htmlToDiscordText(html, maxLength = 1900) {
   text = text.replace(/<code>([\s\S]*?)<\/code>/gi, (_, code) => `\`${code.replace(/`/g, "\\`")}\``);
   text = text.replace(/<[^>]+>/g, "");
   text = decodeHtmlEntities(text);
+  text = replaceMarkdownLinksWithDiscord(text);
   text = linkifyDiscordUrls(text);
   text = text.replace(/\n{3,}/g, "\n\n").trim();
 
@@ -178,6 +186,7 @@ function htmlToDiscordMarkdown(html, maxLength = 3900) {
   text = text.replace(/<code>([\s\S]*?)<\/code>/gi, (_, code) => `\`${code.replace(/`/g, "\\`")}\``);
   text = text.replace(/<[^>]+>/g, "");
   text = decodeHtmlEntities(text);
+  text = replaceMarkdownLinksWithDiscord(text);
   text = linkifyDiscordUrls(text);
   text = text.replace(/\n{3,}/g, "\n\n").trim();
 
@@ -223,8 +232,43 @@ function extractPrimaryDiscordUrl(html) {
   const hrefMatch = source.match(/href="([^"]+)"/i);
   if (hrefMatch) return hrefMatch[1];
 
+  const markdownMatch = source.match(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/i);
+  if (markdownMatch) return markdownMatch[1];
+
   const urlMatch = source.match(/https?:\/\/[^\s<>()\[\]{}]+/i);
   return urlMatch ? urlMatch[0] : null;
+}
+
+function normalizeDiscordFieldValue(name, value, primaryUrl = "") {
+  const label = String(name ?? "").trim();
+  const raw = String(value ?? "").trim();
+  const urlish = /^(url|link|open|visit|deployment url)$/i.test(label);
+
+  if (!raw) {
+    if (urlish) {
+      const fallback = normalizeDiscordUrl(primaryUrl);
+      return fallback ? `<${fallback}>` : "";
+    }
+    return "";
+  }
+
+  const markdown = raw.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/i);
+  if (markdown) {
+    return formatDiscordLink(markdown[2], markdown[1]);
+  }
+
+  const bareUrl = raw.match(/^(https?:\/\/[^\s<>()\[\]{}]+|www\.[^\s<>()\[\]{}]+)$/i);
+  if (bareUrl) {
+    return `<${normalizeDiscordUrl(bareUrl[1])}>`;
+  }
+
+  if (urlish) {
+    const extracted = extractPrimaryDiscordUrl(raw) || primaryUrl;
+    const normalized = normalizeDiscordUrl(extracted);
+    if (normalized) return `<${normalized}>`;
+  }
+
+  return raw;
 }
 
 function buildDiscordEmbedFromText(text) {
@@ -254,14 +298,27 @@ function buildDiscordEmbedFromText(text) {
   }
 
   const description = descriptionParts.join("\n").trim();
-  const urlFieldIndex = fields.findIndex((field) => /^(url|link|open|visit|deployment url)$/i.test(field.name));
+  const normalizedFields = fields
+    .map((field) => ({
+      ...field,
+      value: normalizeDiscordFieldValue(field.name, field.value, primaryUrl),
+    }))
+    .filter((field) => field.value);
+
+  const urlFieldIndex = normalizedFields.findIndex((field) => /^(url|link|open|visit|deployment url)$/i.test(field.name));
   if (urlFieldIndex >= 0) {
-    fields[urlFieldIndex].value = `<${normalizeDiscordUrl(fields[urlFieldIndex].value)}>`;
+    const field = normalizedFields[urlFieldIndex];
+    const normalized = normalizeDiscordUrl(extractPrimaryDiscordUrl(field.value) || primaryUrl);
+    if (normalized) {
+      field.value = `<${normalized}>`;
+    } else {
+      normalizedFields.splice(urlFieldIndex, 1);
+    }
   }
   const embed = {
     title,
-    color: detectDiscordColor(`${title}\n${description}\n${fields.map((field) => `${field.name}: ${field.value}`).join("\n")}`),
-    fields: fields.slice(0, 25),
+    color: detectDiscordColor(`${title}\n${description}\n${normalizedFields.map((field) => `${field.name}: ${field.value}`).join("\n")}`),
+    fields: normalizedFields.slice(0, 25),
     timestamp: new Date().toISOString(),
     footer: {
       text: "GitHub webhook",
