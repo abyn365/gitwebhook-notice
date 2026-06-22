@@ -121,25 +121,18 @@ function decodeHtmlEntities(s) {
 function normalizeDiscordUrl(url) {
   const value = String(url ?? "").trim();
   if (!value) return "";
-
-  const candidate = /^www\./i.test(value) ? `https://${value}` : value;
-  try {
-    const parsed = new URL(candidate);
-    return /^https?:$/i.test(parsed.protocol) ? parsed.toString() : "";
-  } catch {
-    return "";
-  }
+  if (/^https?:\/\//i.test(value)) return value;
+  if (/^www\./i.test(value)) return `https://${value}`;
+  return value;
 }
 
-function hasDiscordUrl(url) {
-  return !!normalizeDiscordUrl(url);
-}
-
-function renderHtmlLink(href, label = "") {
-  const url = normalizeDiscordUrl(href);
-  const text = String(label ?? "").trim();
-  if (!url) return text;
-  return `<a href="${esc(url)}">${esc(text || url)}</a>`;
+function escapeDiscordLinkLabel(text) {
+  return String(text ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)");
 }
 
 function formatDiscordLink(href, label = "") {
@@ -147,7 +140,7 @@ function formatDiscordLink(href, label = "") {
   const text = String(label ?? "").trim();
   if (!url) return text;
   if (!text || text === url) return `<${url}>`;
-  return `${text} <${url}>`;
+  return `[${escapeDiscordLinkLabel(text)}](${url})`;
 }
 
 function linkifyDiscordUrls(text) {
@@ -245,19 +238,20 @@ function detectDiscordColor(text) {
 
 function extractPrimaryDiscordUrl(html) {
   const source = String(html ?? "");
+  const urls = [];
 
-  const hrefMatch = source.match(/href=(?:"([^"]+)"|'([^']+)')/i);
-  if (hrefMatch) {
-    return normalizeDiscordUrl(hrefMatch[1] || hrefMatch[2]);
+  for (const match of source.matchAll(/href="([^"]+)"/gi)) {
+    urls.push(match[1]);
+  }
+  for (const match of source.matchAll(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi)) {
+    urls.push(match[1]);
+  }
+  for (const match of source.matchAll(/https?:\/\/[^\s<>()\[\]{}]+/gi)) {
+    urls.push(match[0]);
   }
 
-  const markdownMatch = source.match(/\[[^\]]+\]\((https?:\/\/[^\s)]+|www\.[^\s)]+)\)/i);
-  if (markdownMatch) {
-    return normalizeDiscordUrl(markdownMatch[1]);
-  }
-
-  const urlMatch = source.match(/https?:\/\/[^\s<>()\[\]{}]+/i);
-  return urlMatch ? normalizeDiscordUrl(urlMatch[0]) : null;
+  if (!urls.length) return null;
+  return normalizeDiscordUrl(urls[urls.length - 1]);
 }
 
 function normalizeDiscordFieldValue(name, value, primaryUrl = "") {
@@ -273,20 +267,20 @@ function normalizeDiscordFieldValue(name, value, primaryUrl = "") {
     return "";
   }
 
-  const markdown = raw.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+|www\.[^\s)]+)\)$/i);
+  const markdown = raw.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/i);
   if (markdown) {
     return formatDiscordLink(markdown[2], markdown[1]);
   }
 
   const bareUrl = raw.match(/^(https?:\/\/[^\s<>()\[\]{}]+|www\.[^\s<>()\[\]{}]+)$/i);
   if (bareUrl) {
-    const normalized = normalizeDiscordUrl(bareUrl[1]);
-    return normalized ? `<${normalized}>` : "";
+    return `<${normalizeDiscordUrl(bareUrl[1])}>`;
   }
 
   if (urlish) {
-    const extracted = extractPrimaryDiscordUrl(raw) || normalizeDiscordUrl(primaryUrl);
-    if (extracted) return `<${extracted}>`;
+    const extracted = extractPrimaryDiscordUrl(raw) || primaryUrl;
+    const normalized = normalizeDiscordUrl(extracted);
+    if (normalized) return `<${normalized}>`;
   }
 
   return raw;
@@ -331,7 +325,7 @@ function buildDiscordEmbedFromText(text) {
     const field = normalizedFields[urlFieldIndex];
     const normalized = normalizeDiscordUrl(extractPrimaryDiscordUrl(field.value) || primaryUrl);
     if (normalized) {
-      field.value = `<${normalized}>`;
+      field.value = `[Open link](${normalized})`;
     } else {
       normalizedFields.splice(urlFieldIndex, 1);
     }
@@ -647,7 +641,7 @@ function buildIssueText(repository, issue, action) {
   return `${emoji} <b>Issue ${esc(action)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>Title:</b> ${renderHtmlLink(issue.html_url, issue.title)}
+<b>Title:</b> <a href="${esc(issue.html_url)}">${esc(issue.title)}</a>
 <b>Author:</b> <code>${esc(issue.user?.login || "unknown")}</code>
 <b>State:</b> <i>${esc(issue.state || "—")}</i>${labels.length ? `\n<b>Labels:</b> ${labels.map((l) => `<code>${esc(l)}</code>`).join(", ")}` : ""}`;
 }
@@ -665,7 +659,7 @@ function buildIssueCommentText(repository, issue, comment, action) {
   return `${emoji} <b>Issue Comment ${esc(action)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>Issue:</b> ${renderHtmlLink(url, `#${esc(String(issue.number))} ${esc(issue.title)}`)}
+<b>Issue:</b> <a href="${esc(url)}">#${esc(String(issue.number))} ${esc(issue.title)}</a>
 <b>Author:</b> <code>${esc(comment.user?.login || "unknown")}</code>`;
 }
 
@@ -705,7 +699,7 @@ function buildPullRequestText(repository, pr, action) {
   return `${emoji} <b>Pull Request ${esc(label)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>Title:</b> ${renderHtmlLink(pr.html_url, pr.title)}
+<b>Title:</b> <a href="${esc(pr.html_url)}">${esc(pr.title)}</a>
 <b>Author:</b> <code>${esc(pr.user?.login || "unknown")}</code>
 <b>Branch:</b> ${branch}${extras.length ? `\n${extras.join("\n")}` : ""}`;
 }
@@ -723,7 +717,7 @@ function buildPullRequestReviewText(repository, pr, review, action) {
   return `${emoji} <b>PR Review ${esc(action)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>PR:</b> ${renderHtmlLink(url, `#${esc(String(pr.number))} ${esc(pr.title)}`)}
+<b>PR:</b> <a href="${esc(url)}">#${esc(String(pr.number))} ${esc(pr.title)}</a>
 <b>Reviewer:</b> <code>${esc(review.user?.login || "unknown")}</code>
 <b>State:</b> <i>${esc(review.state || "—")}</i>`;
 }
@@ -741,7 +735,7 @@ function buildPullRequestReviewCommentText(repository, pr, comment, action) {
   return `${emoji} <b>PR Review Comment ${esc(action)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>PR:</b> ${renderHtmlLink(url, `#${esc(String(pr.number))} ${esc(pr.title)}`)}
+<b>PR:</b> <a href="${esc(url)}">#${esc(String(pr.number))} ${esc(pr.title)}</a>
 <b>Author:</b> <code>${esc(comment.user?.login || "unknown")}</code>`;
 }
 
@@ -766,7 +760,7 @@ function buildDiscussionText(repository, discussion, action) {
   return `${emoji} <b>Discussion ${esc(action)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>Title:</b> ${renderHtmlLink(discussion.html_url, discussion.title)}
+<b>Title:</b> <a href="${esc(discussion.html_url)}">${esc(discussion.title)}</a>
 <b>Author:</b> <code>${esc(discussion.user?.login || "unknown")}</code>
 <b>Category:</b> <i>${esc(discussion.category?.name || "—")}</i>`;
 }
@@ -784,7 +778,7 @@ function buildDiscussionCommentText(repository, discussion, comment, action) {
   return `${emoji} <b>Discussion Comment ${esc(action)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>Discussion:</b> ${renderHtmlLink(url, discussion.title)}
+<b>Discussion:</b> <a href="${esc(url)}">${esc(discussion.title)}</a>
 <b>Author:</b> <code>${esc(comment.user?.login || "unknown")}</code>`;
 }
 
@@ -793,20 +787,9 @@ function buildReleaseText(repository, release, action) {
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
 <b>Tag:</b> <code>${esc(release.tag_name)}</code>
-<b>Name:</b> ${renderHtmlLink(release.html_url, release.name || "untitled")}
+<b>Name:</b> <a href="${esc(release.html_url)}">${esc(release.name || "untitled")}</a>
 <b>Author:</b> <code>${esc(release.author?.login || "unknown")}</code>
 <b>Pre-release:</b> <i>${release.prerelease ? "yes" : "no"}</i>`;
-}
-
-function resolveDeploymentUrl(deployment, deploymentStatus) {
-  return normalizeDiscordUrl(
-    deploymentStatus?.environment_url ||
-    deploymentStatus?.target_url ||
-    deployment?.payload?.url ||
-    deployment?.environment_url ||
-    deployment?.target_url ||
-    ""
-  );
 }
 
 function buildDeploymentStatusText(repository, deployment, deploymentStatus) {
@@ -820,14 +803,14 @@ function buildDeploymentStatusText(repository, deployment, deploymentStatus) {
     waiting: "⏳",
   }[deploymentStatus.state] || "🚀";
 
-  const deploymentUrl = resolveDeploymentUrl(deployment, deploymentStatus);
+  const targetUrl = deploymentStatus.environment_url || deploymentStatus.target_url || deployment.payload?.url || "";
   const description = deploymentStatus.description || deployment.description || "—";
 
   return `${stateEmoji} <b>Deployment ${esc(deploymentStatus.state)}</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
 <b>Environment:</b> <code>${esc(deployment.environment || deploymentStatus.environment || "unknown")}</code>
-<b>Description:</b> <i>${esc(description)}</i>${deploymentUrl ? `\n${renderHtmlLink(deploymentUrl, "Open deployment")}` : ""}`;
+<b>Description:</b> <i>${esc(description)}</i>${targetUrl ? `\n<b>URL:</b> <a href="${esc(targetUrl)}">${esc(targetUrl)}</a>` : ""}`;
 }
 
 function buildDependabotText(repository, alert) {
@@ -875,7 +858,7 @@ function buildCodeScanningText(repository, alert) {
 function buildStarText(repository, sender) {
   return `⭐ <b>New Star</b>
 
-<b>Repo:</b> ${renderHtmlLink(repository.html_url, repository.full_name)}
+<b>Repo:</b> <a href="${esc(repository.html_url)}">${esc(repository.full_name)}</a>
 <b>By:</b> <code>${esc(sender?.login || "unknown")}</code>
 <i>Total: ${esc(String(repository.stargazers_count ?? "?"))} ⭐</i>`;
 }
@@ -883,8 +866,8 @@ function buildStarText(repository, sender) {
 function buildForkText(repository, forkee, sender) {
   return `🍴 <b>Fork</b>
 
-<b>Repo:</b> ${renderHtmlLink(repository.html_url, repository.full_name)}
-<b>Fork:</b> ${renderHtmlLink(forkee?.html_url || repository.html_url, forkee?.full_name || "unknown")}
+<b>Repo:</b> <a href="${esc(repository.html_url)}">${esc(repository.full_name)}</a>
+<b>Fork:</b> <a href="${esc(forkee?.html_url || repository.html_url)}">${esc(forkee?.full_name || "unknown")}</a>
 <b>By:</b> <code>${esc(sender?.login || "unknown")}</code>`;
 }
 
@@ -921,7 +904,7 @@ function buildCheckRunText(repository, checkRun, status, conclusion) {
   return `${emoji} <b>Check Run</b>
 
 <b>Repo:</b> <code>${esc(repository.full_name)}</code>
-<b>Name:</b> ${renderHtmlLink(url, checkRun.name)}
+<b>Name:</b> <a href="${esc(url)}">${esc(checkRun.name)}</a>
 <b>Status:</b> <code>${esc(status)}</code>${conclusionStr}`;
 }
 
@@ -942,7 +925,7 @@ function buildCheckSuiteText(repository, checkSuite, status, conclusion) {
 function buildRepoEventText(repository, action) {
   return `📁 <b>Repository ${esc(action)}</b>
 
-<b>Repo:</b> ${renderHtmlLink(repository.html_url, repository.full_name)}
+<b>Repo:</b> <a href="${esc(repository.html_url)}">${esc(repository.full_name)}</a>
 <b>Default branch:</b> <code>${esc(repository.default_branch || "—")}</code>`;
 }
 
@@ -1328,7 +1311,7 @@ export default async function handler(req, res) {
         const commitUrl = c.url || "";
         const sha = c.id?.slice(0, 7) || "?";
         text += commitUrl
-          ? `• ${renderHtmlLink(commitUrl, sha)} <b>${esc(c.author?.name || "unknown")}:</b> ${esc(shortMsg)}\n`
+          ? `• <a href="${esc(commitUrl)}"><code>${esc(sha)}</code></a> <b>${esc(c.author?.name || "unknown")}:</b> ${esc(shortMsg)}\n`
           : `• <code>${esc(sha)}</code> <b>${esc(c.author?.name || "unknown")}:</b> ${esc(shortMsg)}\n`;
       }
 
@@ -1344,9 +1327,8 @@ export default async function handler(req, res) {
         }
       }
 
-      const compareUrl = normalizeDiscordUrl(compare);
-      if (compareUrl) {
-        text += `\n${renderHtmlLink(compareUrl, "View push →")}`;
+      if (compare) {
+        text += `\n<a href="${esc(compare)}">View push →</a>`;
       }
 
       await sendToAllChats(BOT_TOKEN, NOTIFICATION_TARGETS, text, {
