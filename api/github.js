@@ -254,27 +254,50 @@ function extractPrimaryDiscordUrl(html) {
   return normalizeDiscordUrl(urls[urls.length - 1]);
 }
 
+function isDiscordUrlFieldName(name) {
+  const label = String(name ?? "").trim().toLowerCase();
+  return [
+    "url",
+    "link",
+    "open",
+    "visit",
+    "deployment url",
+    "target url",
+    "homepage",
+    "home page",
+    "website",
+    "preview",
+    "preview url",
+    "release url",
+    "artifact url",
+  ].includes(label);
+}
+
 function normalizeDiscordFieldValue(name, value, primaryUrl = "") {
   const label = String(name ?? "").trim();
   const raw = String(value ?? "").trim();
-  const urlish = /^(url|link|open|visit|deployment url)$/i.test(label);
+  const urlish = isDiscordUrlFieldName(label);
 
   if (!raw) {
     if (urlish) {
       const fallback = normalizeDiscordUrl(primaryUrl);
-      return fallback || "";
+      return fallback ? `<${fallback}>` : "";
     }
     return "";
   }
 
   const markdown = raw.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/i);
   if (markdown) {
+    const normalized = normalizeDiscordUrl(markdown[2]);
+    if (urlish && normalized) return `<${normalized}>`;
     return formatDiscordLink(markdown[2], markdown[1]);
   }
 
   const bareUrl = raw.match(/^(https?:\/\/[^\s<>()\[\]{}]+|www\.[^\s<>()\[\]{}]+)$/i);
   if (bareUrl) {
-    return normalizeDiscordUrl(bareUrl[1]);
+    const normalized = normalizeDiscordUrl(bareUrl[1]);
+    if (urlish && normalized) return `<${normalized}>`;
+    return normalized;
   }
 
   if (urlish) {
