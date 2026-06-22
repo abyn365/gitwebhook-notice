@@ -139,6 +139,121 @@ function htmlToDiscordText(html, maxLength = 1900) {
   return text;
 }
 
+function htmlToDiscordMarkdown(html, maxLength = 3900) {
+  let text = String(html ?? "");
+
+  text = text.replace(/<\s*br\s*\/?>/gi, "\n");
+  text = text.replace(/<\/(p|div|li|h[1-6])>/gi, "\n");
+  text = text.replace(/<a\s+href="([^"]+)">([\s\S]*?)<\/a>/gi, (_, href, label) => {
+    return `[${label}](${href})`;
+  });
+  text = text.replace(/<(b|strong)>/gi, "**");
+  text = text.replace(/<\/(b|strong)>/gi, "**");
+  text = text.replace(/<(i|em)>/gi, "*");
+  text = text.replace(/<\/(i|em)>/gi, "*");
+  text = text.replace(/<code>([\s\S]*?)<\/code>/gi, (_, code) => `\`${code.replace(/`/g, "\\`")}\``);
+  text = text.replace(/<[^>]+>/g, "");
+  text = decodeHtmlEntities(text);
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+
+  if (text.length > maxLength) {
+    text = `${text.slice(0, maxLength - 25)}…\n\n(truncated for Discord)`;
+  }
+
+  return text;
+}
+
+function truncateDiscordText(text, maxLength) {
+  const value = String(text ?? "");
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function isDiscordFieldLine(line) {
+  const normalized = String(line ?? "").replace(/^\*\*|\*\*$/g, "");
+  return /^[A-Za-z0-9][A-Za-z0-9 _/().-]{0,40}:\s+/.test(normalized);
+}
+
+function splitDiscordFieldLine(line) {
+  const normalized = String(line ?? "").replace(/^\*\*|\*\*$/g, "");
+  const match = normalized.match(/^([A-Za-z0-9][A-Za-z0-9 _/().-]{0,40}):(\s+)([\s\S]*)$/);
+  if (!match) return null;
+  return {
+    label: match[1].trim(),
+    value: match[3].trim(),
+  };
+}
+
+function detectDiscordColor(text) {
+  const lower = String(text ?? "").toLowerCase();
+  if (/(✅|success|merged|released|published|opened|created|enabled|started|deployed)/.test(lower)) return 0x2ecc71;
+  if (/(❌|failure|failed|error|closed|deleted|disabled|blocked|rejected)/.test(lower)) return 0xe74c3c;
+  if (/(⏳|queued|pending|in_progress|building|draft|waiting|requested)/.test(lower)) return 0xf1c40f;
+  if (/(🛡️|security|alert|scan)/.test(lower)) return 0x9b59b6;
+  return 0x5865f2;
+}
+
+function extractPrimaryDiscordUrl(html) {
+  const source = String(html ?? "");
+  const hrefMatch = source.match(/href="([^"]+)"/i);
+  if (hrefMatch) return hrefMatch[1];
+
+  const urlMatch = source.match(/https?:\/\/[^\s<>()\[\]{}]+/i);
+  return urlMatch ? urlMatch[0] : null;
+}
+
+function buildDiscordEmbedFromText(text) {
+  const normalized = htmlToDiscordMarkdown(text, 3800);
+  const lines = normalized.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+
+  const titleLine = lines.shift() || "GitHub notification";
+  const title = truncateDiscordText(titleLine.replace(/\*\*/g, ""), 256);
+  const primaryUrl = extractPrimaryDiscordUrl(text);
+  const descriptionParts = [];
+  const fields = [];
+
+  for (const line of lines) {
+    if (isDiscordFieldLine(line)) {
+      const field = splitDiscordFieldLine(line);
+      if (field?.label && field?.value) {
+        fields.push({
+          name: truncateDiscordText(field.label.replace(/\*\*/g, ""), 256),
+          value: truncateDiscordText(field.value.replace(/\*\*/g, ""), 1024),
+          inline: false,
+        });
+      }
+      continue;
+    }
+
+    descriptionParts.push(line.replace(/\*\*/g, ""));
+  }
+
+  const description = descriptionParts.join("\n").trim();
+  const embed = {
+    title,
+    color: detectDiscordColor(`${title}\n${description}\n${fields.map((field) => `${field.name}: ${field.value}`).join("\n")}`),
+    fields: fields.slice(0, 25),
+    timestamp: new Date().toISOString(),
+    footer: {
+      text: "GitHub webhook",
+    },
+    author: {
+      name: "GitHub",
+      icon_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+    },
+  };
+
+  if (description) {
+    embed.description = truncateDiscordText(description, 4096);
+  }
+
+  if (primaryUrl) {
+    embed.url = primaryUrl;
+  }
+
+  return embed;
+}
+
 function parseDiscordTargets(raw) {
   return (raw || "")
     .split(",")
@@ -774,9 +889,15 @@ function buildTelegramPayload(chatId, text, { silent = false, replyMarkup = null
   return payload;
 }
 
-function buildDiscordPayload(text) {
+function buildDiscordPayload(text, options = {}) {
+  const embed = buildDiscordEmbedFromText(text);
+  const content = htmlToDiscordText(text, 1800);
+
   return {
-    content: htmlToDiscordText(text),
+    content,
+    embeds: [embed],
+    username: options.username || "GitHub Bot",
+    avatar_url: options.avatarUrl || "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
     allowed_mentions: { parse: [] },
   };
 }
