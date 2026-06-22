@@ -67,7 +67,7 @@ const BOT_USERNAME   = () => (process.env.BOT_USERNAME || "").trim().replace(/^@
 // ─── group / command routing ──────────────────────────────────────────────────
 
 const GROUP_CHAT_TYPES = new Set(["group", "supergroup"]);
-const DIRECT_COMMANDS  = new Set(["start", "login", "menu", "help", "cancel"]);
+const DIRECT_COMMANDS  = new Set(["start", "login", "menu", "help", "cancel", "broadcast"]);
 
 // Cached bot username (populated from env or getMe API call)
 let _botUsername = BOT_USERNAME() || null;
@@ -628,7 +628,8 @@ function mainMenu() {
      { text: "🔔 Events",       callback_data: "events"   }],
     [{ text: "✏️ Edit Config",  callback_data: "edit"     },
      { text: "📨 Test Message", callback_data: "test"     }],
-    [{ text: "🔒 Sign out",     callback_data: "logout"   }],
+    [{ text: "📣 Broadcast",     callback_data: "broadcast" },
+     { text: "🔒 Sign out",     callback_data: "logout"   }],
   ]);
 }
 
@@ -817,15 +818,22 @@ async function handleToggle(chatId, messageId, callbackId, key) {
   await handleEditMenu(chatId, messageId);
 }
 
-async function handlePendingEdit(chatId, messageId, userId, text) {
+async function handlePendingEdit(chatId, messageId, userId, text, messageFrom = {}) {
   const pending = await getPending(userId, chatId);
   if (!pending) return false; // not in edit mode
 
   const command = parseCommand(text);
   if ((command?.name === "cancel" && isDirectCommandForThisBot(command)) || text.toLowerCase() === "cancel") {
     await clearPending(userId, chatId);
-    await send(chatId, "❌ Edit cancelled.", mainMenu());
+    await send(chatId, pending.type === "broadcast" ? "❌ Broadcast cancelled." : "❌ Edit cancelled.", mainMenu());
     return true;
+  }
+
+  if (pending.type === "broadcast") {
+    if (pending.step === "draft") {
+      return handleBroadcastDraft(chatId, messageId, userId, text, messageFrom);
+    }
+    return false;
   }
 
   const { key } = pending;
@@ -867,6 +875,239 @@ Send <code>-</code> again to confirm, or send /cancel to abort.`,
   return true;
 }
 
+
+function parseTelegramTargets(raw = "") {
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const colonIdx = entry.lastIndexOf(":");
+      let targetChatId = entry;
+      let threadId = null;
+      if (colonIdx > 1) {
+        const tid = Number(entry.slice(colonIdx + 1));
+        if (Number.isFinite(tid) && tid > 0) {
+          targetChatId = entry.slice(0, colonIdx);
+          threadId = tid;
+        }
+      }
+      return { provider: "telegram", chatId: targetChatId, threadId };
+    });
+}
+
+function extractFirstUrl(text = "") {
+  const match = String(text).match(/https?:\/\/[^\s<>()\[\]{}"'`]+/i);
+  return match ? match[0] : "";
+}
+
+function splitBroadcastDraft(text = "") {
+  const raw = String(text ?? "").trim();
+  if (!raw) return { title: "Announcement", body: "" };
+
+  const paragraphSplit = raw.split(/\n\s*\n/);
+  let title = "";
+  let body = "";
+
+  if (paragraphSplit.length > 1) {
+    title = paragraphSplit.shift().trim();
+    body = paragraphSplit.join("\n\n").trim();
+  } else {
+    const lines = raw.split(/\n/);
+    if (lines.length > 1) {
+      title = lines.shift().trim();
+      body = lines.join("\n").trim();
+    } else {
+      body = raw;
+    }
+  }
+
+  title = title || "Announcement";
+  body = body || raw;
+
+  if (title === body) {
+    title = "Announcement";
+  }
+
+  return { title, body };
+}
+
+function buildTelegramBroadcastTemplate({ title, body, url, senderName, senderHandle, sourceCount }) {
+  const lines = [];
+  lines.push(`📣 <b>${esc(title)}</b>`);
+  lines.push("");
+  lines.push(esc(body));
+  if (url) {
+    lines.push("");
+    lines.push(`🔗 <a href="${esc(url)}">Open link</a>`);
+  }
+  lines.push("");
+  lines.push(`<i>Broadcast by ${esc(senderName)}${senderHandle ? ` (@${esc(senderHandle)})` : ""} • ${esc(sourceCount)} target(s)</i>`);
+  return lines.join("\n");
+}
+
+function buildTelegramBroadcastButtons(url) {
+  if (!url) return null;
+  return { inline_keyboard: [[{ text: "🔗 Open link", url }]] };
+}
+
+function buildDiscordBroadcastPayload({ title, body, url, senderName, senderHandle, sourceCount }) {
+  const embed = {
+    title: `📣 ${truncateDiscordText(title, 256)}`,
+    description: truncateDiscordText(body, 4096),
+    color: 0x5865f2,
+    timestamp: new Date().toISOString(),
+    footer: { text: `Broadcast • ${sourceCount} target(s)` },
+    author: {
+      name: senderHandle ? `${senderName} (@${senderHandle})` : senderName,
+      icon_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+    },
+  };
+
+  if (url) {
+    embed.url = url;
+  }
+
+  return {
+    embeds: [embed],
+    username: "GitHub Bot",
+    avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+    allowed_mentions: { parse: [] },
+  };
+}
+
+async function getNotificationTargets() {
+  const chatRaw = await getEffectiveConfig("CHAT_ID");
+  const discordRaw = (await getEffectiveConfig("DISCORD_WEBHOOK_URLS")) || (await getEffectiveConfig("DISCORD_WEBHOOK_URL"));
+  const telegramTargets = parseTelegramTargets(chatRaw);
+  const discordTargets = parseDiscordWebhookTargets(discordRaw);
+  return {
+    telegramTargets,
+    discordTargets,
+    allTargets: [...telegramTargets, ...discordTargets],
+  };
+}
+
+async function handleBroadcastMenu(chatId, messageId, userId) {
+  await setPending(userId, chatId, { type: "broadcast", step: "draft", promptMessageId: messageId });
+  const text = `📣 <b>Broadcast</b>
+
+Send the message you want to send to every configured target.
+
+<i>Tip: use a title on the first line, then add the body below. The first URL will become a button and a Discord embed link.</i>`;
+  await edit(
+    chatId,
+    messageId,
+    text,
+    kb([
+      [{ text: "← Back", callback_data: "home" }],
+    ])
+  );
+}
+
+async function handleBroadcastDraft(chatId, messageId, userId, text, messageFrom = {}) {
+  const pending = await getPending(userId, chatId);
+  if (!pending || pending.type !== "broadcast" || pending.step !== "draft") return false;
+
+  const { title, body } = splitBroadcastDraft(text);
+  const url = extractFirstUrl(text);
+  const senderName = [messageFrom.first_name, messageFrom.last_name].filter(Boolean).join(" ").trim() || "Admin";
+  const senderHandle = messageFrom.username || "";
+  const { allTargets, telegramTargets, discordTargets } = await getNotificationTargets();
+  if (!allTargets.length) {
+    await clearPending(userId, chatId);
+    await send(chatId, "⚠️ No CHAT_ID or DISCORD_WEBHOOK_URLS configured — nowhere to broadcast.", mainMenu());
+    return true;
+  }
+
+  const previewText = buildTelegramBroadcastTemplate({
+    title,
+    body,
+    url,
+    senderName,
+    senderHandle,
+    sourceCount: allTargets.length,
+  });
+
+  await setPending(userId, chatId, {
+    type: "broadcast",
+    step: "confirm",
+    draft: { title, body, url, senderName, senderHandle },
+    targetCounts: { telegram: telegramTargets.length, discord: discordTargets.length, total: allTargets.length },
+  });
+
+  await send(
+    chatId,
+    `📣 <b>Broadcast preview</b>
+
+This will go to <b>${allTargets.length}</b> target(s).
+
+${previewText}
+
+<i>Press send to deliver it, or cancel if it looks wrong.</i>`,
+    kb([
+      [{ text: "🚀 Send broadcast", callback_data: "broadcast_send" }],
+      [{ text: "✖️ Cancel", callback_data: "broadcast_cancel" }],
+    ])
+  );
+
+  return true;
+}
+
+async function handleBroadcastSend(chatId, messageId, userId) {
+  const pending = await getPending(userId, chatId);
+  if (!pending || pending.type !== "broadcast" || pending.step !== "confirm") return false;
+
+  const { draft } = pending;
+  const { allTargets } = await getNotificationTargets();
+
+  if (!allTargets.length) {
+    await clearPending(userId, chatId);
+    await edit(chatId, messageId, "⚠️ No broadcast targets are configured.", mainMenu());
+    return true;
+  }
+
+  await clearPending(userId, chatId);
+  await edit(chatId, messageId, `📨 Sending broadcast to ${allTargets.length} target(s)…`, backMenu("home"));
+
+  const telegramText = buildTelegramBroadcastTemplate({
+    ...draft,
+    sourceCount: allTargets.length,
+  });
+  const telegramMarkup = buildTelegramBroadcastButtons(draft.url);
+  const discordPayload = buildDiscordBroadcastPayload({
+    ...draft,
+    sourceCount: allTargets.length,
+  });
+
+  let ok = 0;
+  let fail = 0;
+
+  for (const target of allTargets) {
+    try {
+      if (target.provider === "discord") {
+        await sendDiscordWebhook(target.url, discordPayload);
+      } else {
+        await send(target.chatId, telegramText, {
+          reply_markup: telegramMarkup || undefined,
+          disable_web_page_preview: false,
+          ...(target.threadId ? { message_thread_id: target.threadId } : {}),
+        });
+      }
+      ok++;
+    } catch (err) {
+      fail++;
+      console.error("Broadcast send error:", err);
+    }
+  }
+
+  const result = fail === 0
+    ? `✅ Broadcast delivered to all ${ok} target(s).`
+    : `⚠️ Broadcast delivered to ${ok}/${allTargets.length} target(s). ${fail} failed — check logs.`;
+
+  await send(chatId, result, mainMenu());
+  return true;
+}
 
 function parseDiscordWebhookTargets(raw = "") {
   return raw
@@ -928,23 +1169,8 @@ async function sendDiscordWebhook(url, payload) {
 }
 
 async function handleTest(chatId, messageId) {
-  const chatRaw = await getEffectiveConfig("CHAT_ID");
-  const discordRaw = (await getEffectiveConfig("DISCORD_WEBHOOK_URLS")) || (await getEffectiveConfig("DISCORD_WEBHOOK_URL"));
-
-  const telegramTargets = chatRaw.split(",").map(s => s.trim()).filter(Boolean).map((entry) => {
-    const colonIdx = entry.lastIndexOf(":");
-    let targetChatId = entry, threadId = null;
-    if (colonIdx > 1) {
-      const tid = Number(entry.slice(colonIdx + 1));
-      if (Number.isFinite(tid) && tid > 0) {
-        targetChatId = entry.slice(0, colonIdx);
-        threadId = tid;
-      }
-    }
-    return { chatId: targetChatId, threadId };
-  });
-  const discordTargets = parseDiscordWebhookTargets(discordRaw);
-  const totalTargets = telegramTargets.length + discordTargets.length;
+  const { telegramTargets, discordTargets, allTargets } = await getNotificationTargets();
+  const totalTargets = allTargets.length;
 
   if (!totalTargets) {
     await edit(chatId, messageId,
@@ -1040,6 +1266,13 @@ export default async function handler(req, res) {
       if (data === "events")   { await handleEvents(chatId, messageId);   return res.status(200).end(); }
       if (data === "edit")     { await handleEditMenu(chatId, messageId); return res.status(200).end(); }
       if (data === "test")     { await handleTest(chatId, messageId);     return res.status(200).end(); }
+      if (data === "broadcast") { await handleBroadcastMenu(chatId, messageId, userId); return res.status(200).end(); }
+      if (data === "broadcast_cancel") {
+        await clearPending(userId, chatId);
+        await edit(chatId, messageId, "❌ Broadcast cancelled.", mainMenu());
+        return res.status(200).end();
+      }
+      if (data === "broadcast_send") { await handleBroadcastSend(chatId, messageId, userId); return res.status(200).end(); }
 
       if (data === "logout") {
         await clearAuthenticated(userId);
@@ -1098,7 +1331,7 @@ export default async function handler(req, res) {
       // is allowed to consume the user's next message as the new value.
       if (groupChat && !directCommand) {
         if (await isAuthenticated(userId)) {
-          const handled = await handlePendingEdit(chatId, msg.message_id, userId, text);
+          const handled = await handlePendingEdit(chatId, msg.message_id, userId, text, msg.from);
           if (handled) return res.status(200).end();
         }
         return res.status(200).end();
@@ -1126,13 +1359,21 @@ export default async function handler(req, res) {
 
       const authenticated = await isAuthenticated(userId);
 
-      // ── /menu or /help ───────────────────────────────────────────────────
+      // ── /menu, /help, or /broadcast ─────────────────────────────────────
       if (directCommand && (command.name === "menu" || command.name === "help")) {
         if (!authenticated) {
           await send(chatId, authPromptText(groupChat));
           return res.status(200).end();
         }
         await handleHome(chatId);
+        return res.status(200).end();
+      }
+      if (directCommand && command.name === "broadcast") {
+        if (!authenticated) {
+          await send(chatId, authPromptText(groupChat));
+          return res.status(200).end();
+        }
+        await handleBroadcastMenu(chatId, msg.message_id, userId);
         return res.status(200).end();
       }
 
@@ -1143,7 +1384,7 @@ export default async function handler(req, res) {
       }
 
       // Authenticated — check for a pending config edit
-      const handled = await handlePendingEdit(chatId, msg.message_id, userId, text);
+      const handled = await handlePendingEdit(chatId, msg.message_id, userId, text, msg.from);
       if (handled) return res.status(200).end();
 
       // Fallback: guide the user in private chat, stay silent in groups
